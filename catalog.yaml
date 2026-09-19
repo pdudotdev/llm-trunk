@@ -1,0 +1,41 @@
+version: 1
+untagged:
+  alias: untagged
+  vendor: anthropic
+  effort: low
+  max_input: 16000
+  max_output: 1500
+
+skills:
+  qa-test-plan-creation:
+    sha256: "01b9eabaa5fb565aa0446eb5953773930078e134fa3432886bc95f36b952ad90"
+    bucket: L
+    alias: qa-test-plan-creation
+    vendor: anthropic
+    effort: high
+    max_input: 180000
+    max_output: 8000
+  qa-test-case-execution:
+    sha256: "27b47310882963fa9468e4b68d8969efa045f7f5fcd76b1f059ec7de27480391"
+    bucket: M
+    alias: qa-test-case-execution
+    vendor: anthropic
+    effort: medium
+    max_input: 80000
+    max_output: 4000
+  qa-bug-logging:
+    sha256: "83faa6a15173383a6d073f1fe33aaaa55a8998fb012d977f3dfe659b79269989"
+    bucket: S
+    alias: qa-bug-logging
+    vendor: anthropic
+    effort: low
+    max_input: 48000
+    max_output: 3000
+  qa-fix-verification:
+    sha256: "66236a51cb71c52fc69cdcdc59260197682e3e3e1fac0418ecd3232b558b8a24"
+    bucket: S
+    alias: qa-fix-verification
+    vendor: anthropic
+    effort: low
+    max_input: 32000
+    max_output: 2000

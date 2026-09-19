@@ -1,0 +1,44 @@
+model_list:
+  - model_name: qa-test-plan-creation
+    litellm_params:
+      model: anthropic/claude-opus-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+
+  - model_name: qa-test-case-execution
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000002
+      output_cost_per_token: 0.00001
+
+  - model_name: qa-bug-logging
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000002
+      output_cost_per_token: 0.00001
+
+  - model_name: qa-fix-verification
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+
+  - model_name: untagged
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+
+litellm_settings:
+  callbacks: ["policy.litellm_callback.proxy_handler_instance"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  # Virtual key for QA usage (all four skill aliases + untagged) is created
+  # at runtime via scripts/create_qa_usage_key.sh once this stack is up.
