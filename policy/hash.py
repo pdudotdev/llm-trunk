@@ -1,5 +1,5 @@
 import hashlib
 
 
-def hash_skill_md(contents: bytes) -> str:
+def sha256_hex(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()

@@ -25,7 +25,7 @@ services:
       - ./policy:/app/policy
       - ./catalog.yaml:/app/catalog.yaml
     ports:
-      - "4000:4000"
+      - "127.0.0.1:4000:4000"
     command: ["--config", "/app/config.yaml", "--port", "4000"]
 
 volumes:

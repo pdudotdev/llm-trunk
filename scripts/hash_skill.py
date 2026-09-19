@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from policy.hash import hash_skill_md
+from policy.hash import sha256_hex
 
 
 def main() -> None:
@@ -19,7 +19,10 @@ def main() -> None:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(hash_skill_md(contents))
+    # Printed as catalog.yaml fields: routing needs both the digest and the
+    # canonical byte length to isolate this file inside a larger payload.
+    print(f'sha256: "{sha256_hex(contents)}"')
+    print(f"bytes: {len(contents)}")
 
 
 if __name__ == "__main__":
