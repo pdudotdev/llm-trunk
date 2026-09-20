@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from policy.hash import sha256_hex
+from policy.hash import sha256_hex, strip_frontmatter
 
 
 def main() -> None:
@@ -19,10 +19,13 @@ def main() -> None:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Printed as catalog.yaml fields: routing needs both the digest and the
-    # canonical byte length to isolate this file inside a larger payload.
-    print(f'sha256: "{sha256_hex(contents)}"')
-    print(f"bytes: {len(contents)}")
+    # Hash the body only (frontmatter stripped) -- that's the only part
+    # Claude Code actually sends verbatim when a skill is invoked. Printed as
+    # catalog.yaml fields: routing needs both the digest and the canonical
+    # byte length to isolate the body inside a larger payload.
+    body = strip_frontmatter(contents)
+    print(f'sha256: "{sha256_hex(body)}"')
+    print(f"bytes: {len(body)}")
 
 
 if __name__ == "__main__":

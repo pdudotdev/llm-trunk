@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 from collections import OrderedDict
 from typing import Any
@@ -11,7 +10,14 @@ from litellm.integrations.custom_logger import CustomLogger
 from policy.decide import INPUT_CAP, PRICE_CLIFF, STALE_HASH, UNKNOWN_SKILL, decide
 from policy.hash import sha256_hex
 
-logger = logging.getLogger("llm_trunk.policy")
+
+def _log(message: str) -> None:
+    # The host process (LiteLLM) owns its own logging config, which we don't
+    # control and can't rely on: its handlers accept WARNING but silently
+    # drop INFO regardless of our own logger's level. print() sidesteps that
+    # entirely -- these lines only need to land in `docker compose logs`.
+    print(message, flush=True)
+
 
 CATALOG_PATH = "/app/catalog.yaml"
 MAX_STICKY_SESSIONS = 1024
@@ -20,7 +26,15 @@ MAX_FRONTMATTER = 4096
 # The bounded quantifier matters: with an unbounded `.*?` a failed match
 # backtracks to end-of-text at every "---" in the payload (markdown rules,
 # pasted diffs), which is O(text * fences) on the per-request hot path.
-FRONTMATTER_RE = re.compile(rf"---\n(.{{0,{MAX_FRONTMATTER}}}?)\n---\n", re.DOTALL)
+FRONTMATTER_RE = re.compile(rf"---\n(.{{0,{MAX_FRONTMATTER}}}?)\n---\n\n?", re.DOTALL)
+
+# Claude Code's actual wire format for a slash-invoked project skill: the
+# YAML frontmatter is stripped client-side and replaced with this tag plus a
+# "Base directory" line, immediately followed by the body verbatim. Confirmed
+# by inspecting a real request -- the raw "---\nname: ...\n---\n" frontmatter
+# never appears on the wire for a skill invoked this way.
+COMMAND_NAME_RE = re.compile(r"<command-name>/(?P<name>[\w-]+)</command-name>")
+BASE_DIR_RE = re.compile(r"Base directory for this skill: [^\n]*\n\n")
 
 DENY_STATUS = {
     UNKNOWN_SKILL: 403,
@@ -67,33 +81,60 @@ def _usage_value(usage, *names):
     return None
 
 
-def _extract_skill(texts: list[str], catalog: dict) -> tuple[str, str] | None:
+def _hash_body(text: str, start: int, row: dict, name: str) -> tuple[str, str] | None:
+    length = row.get("bytes")
+    if length is None:
+        _log(f"llm-trunk: catalog row {name!r} has no 'bytes', cannot verify its hash")
+        return None
+    # The catalog records the canonical body's byte length so the exact
+    # region can be isolated from whatever prompt text surrounds it; hashing
+    # to end-of-message would never match the stored digest.
+    raw = text[start : start + length].encode()[:length]
+    return name, sha256_hex(raw)
+
+
+def _extract_from_command(text: str, catalog: dict) -> tuple[str, str] | None:
+    match = COMMAND_NAME_RE.search(text)
+    if match is None:
+        return None
+    name = match.group("name")
+    row = catalog.get("skills", {}).get(name)
+    if row is None:
+        return None
+    base_dir_match = BASE_DIR_RE.search(text, match.end())
+    if base_dir_match is None:
+        return None
+    return _hash_body(text, base_dir_match.end(), row, name)
+
+
+def _extract_from_frontmatter(text: str, catalog: dict) -> tuple[str, str] | None:
+    # Fallback for raw file content pasted or @-referenced directly (not via
+    # a slash command) -- there, the YAML frontmatter is still present
+    # verbatim, unlike the command-invocation path above.
     skills = catalog.get("skills", {})
+    for match in FRONTMATTER_RE.finditer(text):
+        try:
+            frontmatter = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            continue
+        # A stray "---" block in the prompt can parse to a scalar or list.
+        if not isinstance(frontmatter, dict):
+            continue
+        name = frontmatter.get("name")
+        row = skills.get(name)
+        if row is None:
+            continue
+        found = _hash_body(text, match.end(), row, name)
+        if found:
+            return found
+    return None
+
+
+def _extract_skill(texts: list[str], catalog: dict) -> tuple[str, str] | None:
     for text in texts:
-        for match in FRONTMATTER_RE.finditer(text):
-            try:
-                frontmatter = yaml.safe_load(match.group(1))
-            except yaml.YAMLError:
-                continue
-            # A stray "---" block in the prompt can parse to a scalar or list.
-            if not isinstance(frontmatter, dict):
-                continue
-            name = frontmatter.get("name")
-            row = skills.get(name)
-            if row is None:
-                continue
-            length = row.get("bytes")
-            if length is None:
-                logger.warning(
-                    "llm-trunk: catalog row %r has no 'bytes', cannot verify its hash", name
-                )
-                continue
-            # The catalog records the canonical file's byte length so the exact
-            # SKILL.md region can be isolated from the prompt text that follows
-            # it; hashing to end-of-message would never match the file digest.
-            start = match.start()
-            raw = text[start : start + length].encode()[:length]
-            return name, sha256_hex(raw)
+        found = _extract_from_command(text, catalog) or _extract_from_frontmatter(text, catalog)
+        if found:
+            return found
     return None
 
 
@@ -143,7 +184,9 @@ class SkillRoutingCallback(CustomLogger):
         self, user_api_key_dict, cache, data: dict, call_type: str
     ) -> dict:
         catalog = _load_catalog()
-        headers = data.get("metadata", {}).get("headers", {}) or {}
+        # This LiteLLM version puts request headers under litellm_metadata,
+        # not the "metadata" key some older docs/examples reference.
+        headers = data.get("litellm_metadata", {}).get("headers", {}) or {}
         session_key = self._session_key(user_api_key_dict, data, headers)
 
         messages = _input_messages(data)
@@ -168,7 +211,7 @@ class SkillRoutingCallback(CustomLogger):
         decision = decide(catalog, skill_id, skill_hash, sticky_skill_id, estimated_input_tokens)
 
         if decision.action == "deny":
-            logger.warning("llm-trunk deny [%s]: %s", decision.code, decision.reason)
+            _log(f"llm-trunk deny [{decision.code}]: {decision.reason}")
             raise HTTPException(
                 status_code=DENY_STATUS.get(decision.code, 403), detail=decision.reason
             )
@@ -187,7 +230,7 @@ class SkillRoutingCallback(CustomLogger):
             min(requested_max, decision.max_output) if requested_max else decision.max_output
         )
 
-        data.setdefault("metadata", {})["skill_routing"] = {
+        data.setdefault("litellm_metadata", {})["skill_routing"] = {
             "skill_id": effective_skill_id,
             "skill_hash": skill_hash,
             "alias": decision.alias,
@@ -201,9 +244,9 @@ class SkillRoutingCallback(CustomLogger):
 
         usage = getattr(response_obj, "usage", None)
 
-        logger.info(
-            "llm-trunk spend: %s",
-            json.dumps(
+        _log(
+            "llm-trunk spend: "
+            + json.dumps(
                 {
                     "skill_id": routing.get("skill_id"),
                     "skill_hash": routing.get("skill_hash"),
@@ -216,7 +259,7 @@ class SkillRoutingCallback(CustomLogger):
                     ),
                     "cost": kwargs.get("response_cost"),
                 }
-            ),
+            )
         )
 
 

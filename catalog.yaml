@@ -8,8 +8,8 @@ untagged:
 
 skills:
   qa-test-plan-creation:
-    sha256: "01b9eabaa5fb565aa0446eb5953773930078e134fa3432886bc95f36b952ad90"
-    bytes: 1011
+    sha256: "f3e80152b73f74c06a951f7de131a8a0555dac7887653f7c7e331a051d3924a3"
+    bytes: 780
     bucket: L
     alias: qa-test-plan-creation
     vendor: anthropic
@@ -17,8 +17,8 @@ skills:
     max_input: 180000
     max_output: 8000
   qa-test-case-execution:
-    sha256: "27b47310882963fa9468e4b68d8969efa045f7f5fcd76b1f059ec7de27480391"
-    bytes: 968
+    sha256: "3c82bd904b0ff8cdd30990c59d395cf79eef4175064b120962be32bc3e53286f"
+    bytes: 726
     bucket: M
     alias: qa-test-case-execution
     vendor: anthropic
@@ -26,8 +26,8 @@ skills:
     max_input: 80000
     max_output: 4000
   qa-bug-logging:
-    sha256: "83faa6a15173383a6d073f1fe33aaaa55a8998fb012d977f3dfe659b79269989"
-    bytes: 876
+    sha256: "66fb6922dcdc8842912cdd965c533afd681b926cc0f80e6ab5b3aacac620fda7"
+    bytes: 663
     bucket: S
     alias: qa-bug-logging
     vendor: anthropic
@@ -35,8 +35,8 @@ skills:
     max_input: 48000
     max_output: 3000
   qa-fix-verification:
-    sha256: "66236a51cb71c52fc69cdcdc59260197682e3e3e1fac0418ecd3232b558b8a24"
-    bytes: 877
+    sha256: "0ea6046a29b03995c27c9f3a2805f5e1929c94f9a76926c1a04a8a864c1d0315"
+    bytes: 677
     bucket: S
     alias: qa-fix-verification
     vendor: anthropic

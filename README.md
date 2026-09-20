@@ -8,7 +8,7 @@ llm-trunk sits between Claude Code and Anthropic as a local reverse proxy on `12
 
 **One-time setup**, before any live traffic flows:
 
-1. Each `SKILL.md` in the client repo gets sha256-hashed.
+1. Each `SKILL.md` in the client repo gets sha256-hashed — specifically, the *body* (everything after the YAML frontmatter), since that's the only part Claude Code actually sends verbatim when a skill is invoked.
 2. Those hashes, plus a bucket/alias/effort/token-cap per skill, are recorded in `catalog.yaml` — the single routing table.
 3. The Docker Compose stack (LiteLLM + Postgres) starts up, loading `litellm/config.yaml`, which declares the real Anthropic model behind each alias, pricing, and the custom callback to run on every request.
 4. A scoped virtual key is minted through LiteLLM's own admin API, so the client never sees the real Anthropic key.
@@ -16,7 +16,7 @@ llm-trunk sits between Claude Code and Anthropic as a local reverse proxy on `12
 **Every live request** then flows like this:
 
 1. Claude Code POSTs a `/v1/messages` request to the proxy, invoking a skill (or not).
-2. A custom LiteLLM callback intercepts the request *before* it reaches Anthropic. It figures out which skill (if any) was invoked — from request headers, from a `SKILL.md` embedded in the request, or from session memory if the skill was invoked on an earlier turn in the same conversation — and hashes it.
+2. A custom LiteLLM callback intercepts the request *before* it reaches Anthropic. It figures out which skill (if any) was invoked — from request headers, from Claude Code's own `<command-name>` tag when a skill is invoked via `/skill-name` (Claude Code strips the YAML frontmatter client-side and sends a `Base directory for this skill: ...` line plus the body instead — the raw frontmatter is only a fallback, for content pasted or `@`-referenced directly), or from session memory if the skill was invoked on an earlier turn in the same conversation — and hashes the body.
 3. That skill id + hash is looked up against `catalog.yaml`.
 4. A routing decision is made: tagged skill with a matching hash and an input size under its cap → allow, routed to that skill's model/effort; no skill recognized → allow, routed to the cheap `untagged` fallback; stale hash, oversized input, or a crossed vendor price cliff → deny, and the request never reaches Anthropic.
 5. On allow, the client's own requested model, effort, and `max_tokens` are overridden with the resolved route's, and the skill is remembered for the rest of *that conversation*, so later turns don't need to resend `SKILL.md` to stay on the same route. A different conversation on the same key starts clean at `untagged`.
@@ -29,7 +29,7 @@ This is a personal cost-routing lab, not a production deployment: one Mac, no au
 ### Two repos, one machine
 
 - **llm-trunk** (this repo, public on GitHub) — the gateway itself: compose stack, LiteLLM config, the routing policy in `policy/`, and `catalog.yaml`.
-- **company-client** (local-only, never pushed anywhere) — an emulated "employee checkout": four QA skill trees (test-plan creation, test-case execution, bug logging, fix verification) plus a `.claude/settings.json` pointing `ANTHROPIC_BASE_URL` at the gateway. Exists purely to generate realistic Claude Code traffic for llm-trunk to route — never needs to leave this laptop.
+- **company-client** (local-only, never pushed anywhere) — an emulated "employee checkout": four QA skills at `.claude/skills/<name>/SKILL.md` (test-plan creation, test-case execution, bug logging, fix verification — Claude Code only auto-discovers project skills from `.claude/skills/`, not a bare `skills/` at the repo root) plus a `.claude/settings.json` pointing `ANTHROPIC_BASE_URL` at the gateway. Exists purely to generate realistic Claude Code traffic for llm-trunk to route — never needs to leave this laptop.
 
 ### Three separate Anthropic workspaces
 
@@ -96,18 +96,18 @@ docker compose exec postgres psql -U litellm -d litellm                 # LiteLL
 
 | File | Role |
 |---|---|
-| `scripts/hash_skill.py` | CLI: `python3 scripts/hash_skill.py <path/to/SKILL.md>` prints the `sha256:` and `bytes:` lines for that skill, ready to paste into `catalog.yaml`. Rerun it whenever a `SKILL.md` changes, or its route goes stale. |
-| `catalog.yaml` | The routing table. One row per tagged skill (sha256, bytes, bucket, alias, vendor, effort, `max_input`/`max_output`) plus the `untagged` fallback row. `bytes` is the canonical file length, used to isolate the `SKILL.md` region from surrounding prompt text before hashing. `vendor` is `anthropic` for every row today, but is what lets `decide()` apply the right vendor's price-cliff check once a non-Anthropic route is added. |
+| `scripts/hash_skill.py` | CLI: `python3 scripts/hash_skill.py <path/to/SKILL.md>` strips the file's YAML frontmatter and prints the `sha256:`/`bytes:` of the body, ready to paste into `catalog.yaml`. Rerun it whenever a `SKILL.md` changes, or its route goes stale. |
+| `catalog.yaml` | The routing table. One row per tagged skill (sha256, bytes, bucket, alias, vendor, effort, `max_input`/`max_output`) plus the `untagged` fallback row. `sha256`/`bytes` describe the skill's *body* (frontmatter stripped) — the only part Claude Code sends verbatim — used to isolate that exact region from surrounding prompt text before hashing. `vendor` is `anthropic` for every row today, but is what lets `decide()` apply the right vendor's price-cliff check once a non-Anthropic route is added. |
 | `docker-compose.yml` | Brings up the two containers: `postgres` (spend/virtual-key storage) and `litellm` (the proxy itself), mounting `litellm/config.yaml`, `policy/`, and `catalog.yaml` into the LiteLLM container. |
 | `litellm/config.yaml` | LiteLLM's own config, loaded on boot: the `model_list` mapping each catalog alias to a real Anthropic model id and its per-token pricing, the `callbacks` entry registering `policy.litellm_callback.proxy_handler_instance`, and `general_settings` (master key, database URL). |
-| `scripts/create_qa_usage_key.sh` | Run once the stack is up: calls LiteLLM's `/key/generate` admin endpoint to mint the `qa-usage`-labeled virtual key, scoped to all four skill aliases plus `untagged`. The secret it returns — not anything in this repo — is what the client actually authenticates with. |
+| `scripts/create_qa_usage_key.sh` | Run once the stack is up: calls LiteLLM's `/key/generate` admin endpoint to mint the `qa-usage`-labeled virtual key. Deliberately has no `models` restriction — LiteLLM checks a key's model allow-list against the client's *original* requested model, before the callback ever rewrites it, and Claude Code never sends our alias names directly. Access control is `decide()`'s job. The secret it returns — not anything in this repo — is what the client actually authenticates with. |
 
 ### Per-request phase
 
 | File | Role |
 |---|---|
-| `policy/litellm_callback.py` | The custom `CustomLogger` LiteLLM invokes on every request. `async_pre_call_hook` resolves the skill (`x-skill-id` + `x-skill-hash` headers, which are only honoured together → embedded `SKILL.md` → sticky session → untagged), calls `decide()`, then either raises an HTTP error (deny) or pins the model, effort, and `max_tokens` and remembers the skill for that conversation. `async_log_success_event` logs the outcome once Anthropic responds. |
-| `policy/hash.py` | One function, `sha256_hex()` — the single hashing entry point, used for both the extracted `SKILL.md` digest and the conversation fingerprint, by the callback above and `scripts/hash_skill.py`. |
+| `policy/litellm_callback.py` | The custom `CustomLogger` LiteLLM invokes on every request. `async_pre_call_hook` resolves the skill — `x-skill-id` + `x-skill-hash` headers (only honoured together) → Claude Code's `<command-name>` tag + `Base directory for this skill:` marker (the real invocation path) → raw frontmatter (fallback, for pasted/`@`-referenced content) → sticky session → untagged — calls `decide()`, then either raises an HTTP error (deny) or pins the model, effort, and `max_tokens` and remembers the skill for that conversation. `async_log_success_event` logs the outcome once Anthropic responds. |
+| `policy/hash.py` | `sha256_hex()` — the single hashing entry point, used by the callback above (for both the extracted body and the conversation fingerprint) and `scripts/hash_skill.py`. Also `strip_frontmatter()`, used only by `scripts/hash_skill.py` to remove a `SKILL.md`'s YAML header before hashing (the callback locates the body a different way — via a regex match's end position — since it's working inside a larger string, not a lone file). |
 | `policy/cliffs.py` | Vendor input-size price-cliff thresholds (Grok/Gemini at 200k, OpenAI Astra-class at 272k). Called from `decide()` on every request via each catalog row's `vendor` field — a no-op today since every row is `anthropic` (no cliff), but live and ready for the moment a row's vendor changes. |
 | `policy/decide.py` | The routing policy itself, as a pure function: given the catalog, a candidate skill id/hash, any sticky skill from earlier turns, and an estimated input size, returns an allow/deny `Decision` with the alias, effort, and reason — checking stale hash, vendor price cliffs, and the row's `max_input` cap. No LiteLLM or network dependency. |
 | `policy/__init__.py` | Empty — makes `policy/` an importable Python package. |
