@@ -11,6 +11,10 @@ Skill-tagged routing gateway for Claude Code, built on [LiteLLM](https://docs.li
 - [x] **Untagged frame** → falls back to the native VLAN. Here: falls back to `untagged` (Haiku, low effort)
 - [x] **Unrecognized tag** → dropped at the port, not forwarded. Here: `catalog.yaml` is the allowed-VLAN list
 
+▫️ **Where the analogy breaks — no defense against "VLAN hopping" yet:**
+- [x] Can't fake owning a tag — wrong hash for a skill id gets dropped
+- [ ] The tag isn't a secret — it's a hash of files every employee can read. Anyone can compute it and self-assert straight into the priciest route via `x-skill-id`/`x-skill-hash` headers, bypassing Claude Code's own invocation flow — no per-key restriction on the header path today
+
 ## 📖 **Table of Contents**
 - 🔀 **llm-trunk**
   - [🔭 Overview](#-overview)
@@ -144,6 +148,7 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 - [ ] Live unrouted-baseline comparison run, with a documented $ delta
 - [ ] A real non-Anthropic vendor added to `catalog.yaml` (first live exercise of `policy/cliffs.py`)
 - [ ] Per-department virtual keys (`sk-dev-usage`, `sk-hr-usage`, ...) if a second real consumer shows up
+- [ ] Restrict `x-skill-id`/`x-skill-hash` header self-assertion to a CI-scoped key, closing the "tag isn't a secret" gap
 
 ## 📄 Disclaimer
 You're responsible for funding your own Anthropic API credits, keeping the three workspace keys separate, and validating `catalog.yaml` against your own skill files before routing real traffic through this.
