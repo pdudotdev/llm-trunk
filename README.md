@@ -11,9 +11,9 @@ Skill-tagged routing gateway for Claude Code, built on [LiteLLM](https://docs.li
 - [x] **Untagged frame** → falls back to the native VLAN. Here: falls back to `untagged` (Haiku, low effort)
 - [x] **Unrecognized tag** → dropped at the port, not forwarded. Here: `catalog.yaml` is the allowed-VLAN list
 
-▫️ **Where the analogy breaks — no defense against "VLAN hopping" yet:**
+▫️ **Where the analogy could have broken — "VLAN hopping" via a self-asserted tag:**
 - [x] Can't fake owning a tag — wrong hash for a skill id gets dropped
-- [ ] The tag isn't a secret — it's a hash of files every employee can read. Anyone can compute it and self-assert straight into the priciest route via `x-skill-id`/`x-skill-hash` headers, bypassing Claude Code's own invocation flow — no per-key restriction on the header path today
+- [x] Can't self-assert one either — the tag isn't a secret (it's a hash of files every employee can read), so `x-skill-id`/`x-skill-hash` headers are only honored from a virtual key explicitly flagged for it (`metadata: {"trust_skill_headers": true}` at key-mint time). No key is flagged today, so the header path is inert for every current caller — real Claude Code traffic never sends these headers anyway
 
 ## 📖 **Table of Contents**
 - 🔀 **llm-trunk**
@@ -138,7 +138,7 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 
 | File | Role |
 |---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers → `<command-name>` tag + `Base directory` marker (real path) → raw frontmatter (fallback) → sticky session → untagged — calls `decide()`, then denies or pins model/effort/`max_tokens`. Remembers the skill for that conversation, but the entry expires after 10 minutes idle or 30 minutes since the last real invocation (whichever first), reverting later requests to `untagged`. Logs the outcome once Anthropic responds. |
+| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers (only honored from a key flagged `trust_skill_headers` in its own metadata; none are today) → `<command-name>` tag + `Base directory` marker (real path) → raw frontmatter (fallback) → sticky session → untagged — calls `decide()`, then denies or pins model/effort/`max_tokens`. Remembers the skill for that conversation, but the entry expires after 10 minutes idle or 30 minutes since the last real invocation (whichever first), reverting later requests to `untagged`. Logs the outcome once Anthropic responds. |
 | [`policy/hash.py`](policy/hash.py) | `sha256_hex()` — the single hashing entry point, used by the callback (body hash + conversation fingerprint) and `scripts/hash_skill.py`. `strip_frontmatter()`, used only by `scripts/hash_skill.py` (the callback locates the body via a regex match's end position instead). |
 | [`policy/cliffs.py`](policy/cliffs.py) | Vendor input-size price-cliff thresholds (Grok/Gemini 200k, OpenAI Astra-class 272k). Called from `decide()` on every request — a no-op today since every row is `anthropic`, but live and ready for a non-Anthropic vendor. |
 | [`policy/decide.py`](policy/decide.py) | The routing policy, as a pure function: catalog + candidate skill id/hash + sticky skill + estimated input size → an allow/deny `Decision` with alias, effort, reason — checking for an unrecognized skill id, a stale hash, price cliffs, and the `max_input` cap. No LiteLLM or network dependency. |
@@ -148,7 +148,6 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 - [ ] Live unrouted-baseline comparison run, with a documented $ delta
 - [ ] A real non-Anthropic vendor added to `catalog.yaml` (first live exercise of `policy/cliffs.py`)
 - [ ] Per-department virtual keys (`sk-dev-usage`, `sk-hr-usage`, ...) if a second real consumer shows up
-- [ ] Restrict `x-skill-id`/`x-skill-hash` header self-assertion to a CI-scoped key, closing the "tag isn't a secret" gap
 
 ## 📄 Disclaimer
 You're responsible for funding your own Anthropic API credits, keeping the three workspace keys separate, and validating `catalog.yaml` against your own skill files before routing real traffic through this.

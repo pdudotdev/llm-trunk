@@ -205,6 +205,20 @@ class SkillRoutingCallback(CustomLogger):
         while len(self._sticky) > MAX_STICKY_SESSIONS:
             self._sticky.popitem(last=False)
 
+    def _headers_trusted(self, user_api_key_dict) -> bool:
+        # x-skill-id/x-skill-hash are a self-asserted claim: the hash proves
+        # content integrity (decide() rejects a wrong one), but nothing here
+        # proves authorization -- any caller who can read a skill file can
+        # compute its real hash and assert it directly, bypassing Claude
+        # Code's own invocation flow entirely. Real Claude Code traffic never
+        # sends these headers, so only a key explicitly flagged via its own
+        # metadata (set at `/key/generate` time, e.g.
+        # `"metadata": {"trust_skill_headers": true}`) may use this path at
+        # all. No key is flagged today -- this is a dormant mechanism for a
+        # future non-interactive consumer, not something currently in use.
+        metadata = getattr(user_api_key_dict, "metadata", None) or {}
+        return bool(metadata.get("trust_skill_headers"))
+
     def _estimate_input_tokens(self, model: str, messages: list[dict], texts: list[str]) -> int:
         try:
             import litellm
@@ -225,8 +239,10 @@ class SkillRoutingCallback(CustomLogger):
         messages = _input_messages(data)
         texts = _candidate_texts(messages)
 
-        skill_id = headers.get("x-skill-id")
-        skill_hash = headers.get("x-skill-hash")
+        skill_id = skill_hash = None
+        if self._headers_trusted(user_api_key_dict):
+            skill_id = headers.get("x-skill-id")
+            skill_hash = headers.get("x-skill-hash")
 
         # An id without a hash is an unverified client claim, so both headers
         # are required together; otherwise fall through to body extraction.
