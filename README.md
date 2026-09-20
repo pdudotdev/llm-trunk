@@ -39,6 +39,8 @@ Kept apart so each produces its own clean, comparable bill:
 - **Routed-client** — the only Anthropic key llm-trunk ever holds (`ANTHROPIC_API_KEY` in `.env`). Every tagged and `untagged` request that makes it past `decide()` bills here.
 - **Unrouted-baseline** — a separate Claude Code profile with no base-url override, running the identical QA prompts directly against Anthropic with no routing at all. Its bill is the "what if we hadn't routed" control group.
 
+**Claude Code's own auth (subscription vs. API key) only matters for the Builder session.** The `company-client` session never authenticates with Anthropic at all — its `.claude/settings.json` redirects it entirely to the local gateway (`ANTHROPIC_BASE_URL=http://127.0.0.1:4000` + a LiteLLM virtual key as `ANTHROPIC_AUTH_TOKEN`), bypassing whatever auth Claude Code would otherwise use. The gateway itself is the only thing that ever calls Anthropic, always using the real `ANTHROPIC_API_KEY` in `.env` (hardcoded per-model in `litellm/config.yaml`) — regardless of how any Claude Code session, builder included, is authenticated. That key needs its own funded API credits: a Claude.ai/Pro/Max subscription is a separate billing product from the standalone Anthropic API and doesn't fund it.
+
 ### How this gets tested
 
 The real test is a bill comparison, not a unit test: run the same QA tasks (test plan, test execution, bug log, fix verification) once **routed** through llm-trunk and once **unrouted** direct to Anthropic with no gateway, then compare the two bills. That's what shows whether skill-tagged routing actually saves money — the routing logic itself is already covered by `decide()`'s own checks.
