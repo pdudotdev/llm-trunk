@@ -219,6 +219,21 @@ class SkillRoutingCallback(CustomLogger):
         metadata = getattr(user_api_key_dict, "metadata", None) or {}
         return bool(metadata.get("trust_skill_headers"))
 
+    def _allowed_skills(self, user_api_key_dict) -> set[str] | None:
+        # Closes the gap header-trust gating didn't: the tag itself can be
+        # forged by anyone who can read a skill file (it's not a secret), so
+        # trusting a *claim* -- however it was resolved, headers or a forged
+        # <command-name> block -- was never going to work. This checks who is
+        # actually allowed to *reach* each lane, after extraction, before
+        # decide() ever sees the claim. A key without this metadata field is
+        # unrestricted (today's qa-usage key: it legitimately needs every
+        # skill, so there is nothing to allow-list yet). `untagged` is never
+        # restricted -- there is nothing to protect by blocking the cheap
+        # default lane.
+        metadata = getattr(user_api_key_dict, "metadata", None) or {}
+        allowed = metadata.get("allowed_skills")
+        return set(allowed) if isinstance(allowed, list) else None
+
     def _estimate_input_tokens(self, model: str, messages: list[dict], texts: list[str]) -> int:
         try:
             import litellm
@@ -253,6 +268,14 @@ class SkillRoutingCallback(CustomLogger):
                 skill_id, skill_hash = extracted
 
         sticky_skill_id = self._get_sticky(session_key)
+
+        allowed_skills = self._allowed_skills(user_api_key_dict)
+        if allowed_skills is not None:
+            if skill_id is not None and skill_id not in allowed_skills:
+                skill_id = skill_hash = None
+            if sticky_skill_id is not None and sticky_skill_id not in allowed_skills:
+                sticky_skill_id = None
+
         estimated_input_tokens = self._estimate_input_tokens(
             data.get("model", ""), messages, texts
         )

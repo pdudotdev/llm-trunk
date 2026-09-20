@@ -13,16 +13,24 @@ set +a
 # to the alias names blocks every real request at the gate. Access control
 # is decide()'s job, not this key's.
 #
-# max_budget/budget_duration are an orthogonal backstop, independent of
-# routing: even if the sticky-route abuse case in litellm_callback.py were
-# never found, this caps total spend per key per period regardless. Purely
-# a LiteLLM feature -- adjust the numbers for your own usage, no code
-# changes needed elsewhere.
+# max_budget/budget_duration/tpm_limit/rpm_limit are an orthogonal backstop,
+# independent of routing/decide() -- pure LiteLLM key settings, no code
+# changes needed elsewhere. Bounds total damage across ALL lanes combined,
+# not per-lane: LiteLLM's per-model equivalents (model_max_budget,
+# model_rpm_limit/model_tpm_limit) don't help here -- model_max_budget is
+# gated behind a paid Enterprise license (confirmed: /key/generate rejects
+# it without one), and model_rpm_limit/model_tpm_limit are silently
+# swallowed into inert metadata by this LiteLLM version instead of being
+# enforced (confirmed via /key/info -- no error, but no effect either).
+# Actual per-lane access control is allowed_skills below, enforced in
+# litellm_callback.py's _allowed_skills().
 curl -s -X POST "http://127.0.0.1:4000/key/generate" \
   -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "metadata": {"name": "qa-usage"},
     "max_budget": 50,
-    "budget_duration": "30d"
+    "budget_duration": "30d",
+    "rpm_limit": 20,
+    "tpm_limit": 200000
   }'
