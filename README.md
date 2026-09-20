@@ -58,13 +58,13 @@ docker compose down                # stop everything
 
 `catalog.yaml` is re-read on every request — edits apply immediately. Editing anything under `policy/` needs `docker compose restart litellm` to take effect.
 
-**Create the virtual key** (once, after the stack is up)
+**Set up your client repo** (once, after the stack is up)
 
 ```bash
 ./scripts/create_qa_usage_key.sh
 ```
 
-Copy the `key` field from the response into `company-client/.claude/settings.json` as `ANTHROPIC_AUTH_TOKEN`.
+Copy `client-settings.json.example` to `<your-client-repo>/.claude/settings.json`, and paste the `key` field from the response above in place of the placeholder `ANTHROPIC_AUTH_TOKEN`. Claude Code only picks this up from the directory it's launched in — see [Lab design](#lab-design) for why that has to be a separate repo/session from this one.
 
 **Hash a skill** (whenever a `SKILL.md` changes)
 
@@ -101,6 +101,7 @@ docker compose exec postgres psql -U litellm -d litellm                 # LiteLL
 | `docker-compose.yml` | Brings up the two containers: `postgres` (spend/virtual-key storage) and `litellm` (the proxy itself), mounting `litellm/config.yaml`, `policy/`, and `catalog.yaml` into the LiteLLM container. |
 | `litellm/config.yaml` | LiteLLM's own config, loaded on boot: the `model_list` mapping each catalog alias to a real Anthropic model id and its per-token pricing, the `callbacks` entry registering `policy.litellm_callback.proxy_handler_instance`, and `general_settings` (master key, database URL). |
 | `scripts/create_qa_usage_key.sh` | Run once the stack is up: calls LiteLLM's `/key/generate` admin endpoint to mint the `qa-usage`-labeled virtual key. Deliberately has no `models` restriction — LiteLLM checks a key's model allow-list against the client's *original* requested model, before the callback ever rewrites it, and Claude Code never sends our alias names directly. Access control is `decide()`'s job. The secret it returns — not anything in this repo — is what the client actually authenticates with. |
+| `client-settings.json.example` | Template for `<your-client-repo>/.claude/settings.json` — the `env` block that points a Claude Code session at the gateway. Not `company-client`'s own copy (that repo is local-only and never pushed), so this is what anyone else adopting llm-trunk actually has to work from. |
 
 ### Per-request phase
 
