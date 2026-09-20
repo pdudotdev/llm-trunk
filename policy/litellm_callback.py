@@ -86,6 +86,21 @@ def _candidate_texts(messages: list[dict]) -> list[str]:
     return [_message_text(message.get("content")) for message in messages]
 
 
+def _latest_user_text(data: dict) -> str:
+    # Claude Code resends the full conversation on every turn, so scanning
+    # every message for a skill invocation finds a stale one from an earlier
+    # turn and treats it as live -- pinning the route forever (stickiness
+    # timers never get a chance to fire) and making it impossible to switch
+    # skills (the older, no-longer-relevant block wins first-match). Only the
+    # newest user turn can contain *this* turn's real invocation; anything
+    # not found there correctly falls through to the sticky path instead,
+    # where it belongs.
+    for message in reversed(data.get("messages", [])):
+        if message.get("role") == "user":
+            return _message_text(message.get("content"))
+    return ""
+
+
 def _usage_value(usage, *names):
     for name in names:
         value = getattr(usage, name, None)
@@ -260,10 +275,11 @@ class SkillRoutingCallback(CustomLogger):
             skill_hash = headers.get("x-skill-hash")
 
         # An id without a hash is an unverified client claim, so both headers
-        # are required together; otherwise fall through to body extraction.
+        # are required together; otherwise fall through to body extraction,
+        # scoped to only the newest user turn (see _latest_user_text).
         if not (skill_id and skill_hash):
             skill_id = skill_hash = None
-            extracted = _extract_skill(texts, catalog)
+            extracted = _extract_skill([_latest_user_text(data)], catalog)
             if extracted:
                 skill_id, skill_hash = extracted
 
