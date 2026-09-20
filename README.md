@@ -4,14 +4,14 @@
 [![License](https://img.shields.io/badge/license-GPLv3-1a1a2e)](LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/pdudotdev/llm-trunk?color=1a1a2e)](https://github.com/pdudotdev/llm-trunk/commits/master/)
 
-Skill-tagged routing gateway for Claude Code, built on [LiteLLM](https://docs.litellm.ai/). Routes traffic to a specific Anthropic model + effort level based on which QA skill was invoked — identified by the sha256 hash of that skill's `SKILL.md` body, not a prompt classifier.
+Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Routes traffic to a specific model + effort level based on which skill was invoked - identified by the sha256 hash of that skill's `SKILL.md` body, not a prompt classifier.
 
 ▫️ **Same idea as an 802.1Q trunk port:**
 - [x] **Tagged frame** → VLAN ID routes it down that VLAN. Here: skill hash → routes down that skill's model/effort lane
-- [x] **Untagged frame** → falls back to the native VLAN. Here: falls back to `untagged` (Haiku, low effort)
+- [x] **Untagged frame** → falls back to the native VLAN. Here: falls back to `untagged` (e.g. Haiku, low effort)
 - [x] **Unrecognized tag** → dropped at the port, not forwarded. Here: `catalog.yaml` is the allowed-VLAN list
 
-▫️ **Where the analogy could have broken — "VLAN hopping" via a self-asserted tag:**
+▫️ **"VLAN hopping" protection:**
 - [x] Can't fake owning a tag — wrong hash for a skill id gets dropped
 - [x] Headers can't self-assert one — `x-skill-id`/`x-skill-hash` are only honored from a key explicitly flagged for it (`metadata: {"trust_skill_headers": true}`); no key is flagged today
 - [x] Nor can a forged body — the tag isn't a secret (it's a hash of files every employee can read), so a hand-crafted `<command-name>` block with the real file bytes hashes correctly too. Closed the same way real VLAN hopping is: not by hiding the tag, but by checking what each *port* (key) is actually allowed to carry — `allowed_skills` in a key's `metadata` is checked before routing, downgrading to `untagged` if the claimed skill isn't on it. Today's single `qa-usage` key is intentionally unrestricted (it legitimately needs every skill), so this isn't yet an active boundary for that key — it becomes one the moment a second, narrower-scoped key exists
@@ -20,7 +20,6 @@ Skill-tagged routing gateway for Claude Code, built on [LiteLLM](https://docs.li
 - 🔀 **llm-trunk**
   - [🔭 Overview](#-overview)
   - [🔀 How It Works](#-how-it-works)
-  - [🧪 Lab Design](#-lab-design)
   - [🚀 Installation & Usage](#-installation--usage)
   - [📂 Project Files](#-project-files)
   - [⬆️ Planned Upgrades](#️-planned-upgrades)
@@ -61,29 +60,12 @@ A local reverse proxy sitting between Claude Code and Anthropic on `127.0.0.1:40
 - [x] **Deny** → unrecognized skill id, stale hash, oversized input, or a crossed vendor price cliff — the request never reaches Anthropic
 - [x] Once Anthropic responds, skill/alias/effort/tokens/cost get logged, for routed-vs-unrouted bill comparisons
 
-## 🧪 Lab Design
-
-Personal cost-routing lab, not a production deployment — one Mac, no auth beyond LiteLLM's own keys, stops the moment the Mac sleeps.
-
-▫️ **Two repos, one machine:**
-- [x] **llm-trunk** (this repo) — the gateway: compose stack, LiteLLM config, `policy/`, `catalog.yaml`
-- [x] **company-client** (local-only, never pushed) — an emulated "employee checkout": four QA skills at `.claude/skills/<name>/SKILL.md` + a `.claude/settings.json` pointing at the gateway
-
-▫️ **Three separate Anthropic workspaces**, so each produces a clean, comparable bill:
-- [x] **Builder** — this Claude Code session; never goes through the gateway
-- [x] **Routed-client** — the only Anthropic key llm-trunk holds (`.env`); every tagged/untagged request bills here
-- [x] **Unrouted-baseline** — a separate Claude Code profile, same prompts, no gateway — the "what if we hadn't routed" control group
-
-▫️ **Claude Code's own auth only matters for Builder** — `company-client` bypasses it entirely via `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`. Only the gateway's own `ANTHROPIC_API_KEY` in `.env` ever calls Anthropic, and it needs real funded API credits — a Claude.ai subscription doesn't cover it.
-
-▫️ **How this gets tested:** run the same QA tasks once routed through llm-trunk, once unrouted direct to Anthropic, then compare the two bills. `decide()`'s own checks already cover routing correctness — the bill comparison is what proves the savings.
-
 ## 🚀 Installation & Usage
 
 ▫️ **Prerequisites:**
 - Docker (Compose v2)
 - Python 3.11+
-- An Anthropic API key with funded credits
+- API key(s)
 
 ▫️ **Step 1 - Clone & configure:**
 ```
@@ -146,15 +128,15 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 | `policy/__init__.py` | Empty — makes `policy/` an importable Python package. |
 
 ## ⬆️ Planned Upgrades
-- [ ] Live unrouted-baseline comparison run, with a documented $ delta
-- [ ] A real non-Anthropic vendor added to `catalog.yaml` (first live exercise of `policy/cliffs.py`)
-- [ ] Per-department virtual keys (`sk-dev-usage`, `sk-hr-usage`, ...) if a second real consumer shows up, each scoped with `allowed_skills`
+- [ ] Having two parallel LiteLLM processes running, with shared state via Redis
+- [ ] Non-Anthropic vendors added to `catalog.yaml`, exercising `policy/cliffs.py`
+- [ ] Per-department virtual keys (`sk-dev-usage`), each scoped with `allowed_skills`
 
 ## 📄 Disclaimer
-You're responsible for funding your own Anthropic API credits, keeping the three workspace keys separate, and validating `catalog.yaml` against your own skill files before routing real traffic through this.
+You're responsible for creating your own API keys, funding your credits, and validating `catalog.yaml` against your own skill files before routing real traffic through llm-trunk.
 
 ## 📜 License
 Licensed under the [**GNU General Public License v3.0**](LICENSE).
 
 ## 📧 Hi
-Wanna say hello? Send me a DM at [**LinkedIn**](https://www.linkedin.com/in/tmihaicatalin/).
+Wanna say hello? DM me on [**LinkedIn**](https://www.linkedin.com/in/tmihaicatalin/).
