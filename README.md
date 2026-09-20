@@ -18,7 +18,7 @@ llm-trunk sits between Claude Code and Anthropic as a local reverse proxy on `12
 1. Claude Code POSTs a `/v1/messages` request to the proxy, invoking a skill (or not).
 2. A custom LiteLLM callback intercepts the request *before* it reaches Anthropic. It figures out which skill (if any) was invoked — from request headers, from Claude Code's own `<command-name>` tag when a skill is invoked via `/skill-name` (Claude Code strips the YAML frontmatter client-side and sends a `Base directory for this skill: ...` line plus the body instead — the raw frontmatter is only a fallback, for content pasted or `@`-referenced directly), or from session memory if the skill was invoked on an earlier turn in the same conversation — and hashes the body.
 3. That skill id + hash is looked up against `catalog.yaml`.
-4. A routing decision is made: tagged skill with a matching hash and an input size under its cap → allow, routed to that skill's model/effort; no skill recognized → allow, routed to the cheap `untagged` fallback; stale hash, oversized input, or a crossed vendor price cliff → deny, and the request never reaches Anthropic.
+4. A routing decision is made: tagged skill with a matching hash and an input size under its cap → allow, routed to that skill's model/effort; no skill recognized → allow, routed to the cheap `untagged` fallback; an unrecognized skill id, a stale hash, oversized input, or a crossed vendor price cliff → deny, and the request never reaches Anthropic.
 5. On allow, the client's own requested model, effort, and `max_tokens` are overridden with the resolved route's, and the skill is remembered for the rest of *that conversation*, so later turns don't need to resend `SKILL.md` to stay on the same route. A different conversation on the same key starts clean at `untagged`.
 6. Once Anthropic responds, the callback logs which skill/alias/effort/tokens/cost were involved, for later routed-vs-unrouted bill comparisons.
 
@@ -56,7 +56,7 @@ docker compose logs -f litellm    # watch it boot; catches callback import error
 docker compose down                # stop everything
 ```
 
-`catalog.yaml` is re-read on every request — edits apply immediately. Editing anything under `policy/` needs `docker compose restart litellm` to take effect.
+`catalog.yaml` is re-read on every request — edits apply immediately. Editing anything under `policy/` or `litellm/config.yaml` needs `docker compose restart litellm` to take effect (both are only loaded once, at startup).
 
 **Set up your client repo** (once, after the stack is up)
 
@@ -110,5 +110,5 @@ docker compose exec postgres psql -U litellm -d litellm                 # LiteLL
 | `policy/litellm_callback.py` | The custom `CustomLogger` LiteLLM invokes on every request. `async_pre_call_hook` resolves the skill — `x-skill-id` + `x-skill-hash` headers (only honoured together) → Claude Code's `<command-name>` tag + `Base directory for this skill:` marker (the real invocation path) → raw frontmatter (fallback, for pasted/`@`-referenced content) → sticky session → untagged — calls `decide()`, then either raises an HTTP error (deny) or pins the model, effort, and `max_tokens` and remembers the skill for that conversation. `async_log_success_event` logs the outcome once Anthropic responds. |
 | `policy/hash.py` | `sha256_hex()` — the single hashing entry point, used by the callback above (for both the extracted body and the conversation fingerprint) and `scripts/hash_skill.py`. Also `strip_frontmatter()`, used only by `scripts/hash_skill.py` to remove a `SKILL.md`'s YAML header before hashing (the callback locates the body a different way — via a regex match's end position — since it's working inside a larger string, not a lone file). |
 | `policy/cliffs.py` | Vendor input-size price-cliff thresholds (Grok/Gemini at 200k, OpenAI Astra-class at 272k). Called from `decide()` on every request via each catalog row's `vendor` field — a no-op today since every row is `anthropic` (no cliff), but live and ready for the moment a row's vendor changes. |
-| `policy/decide.py` | The routing policy itself, as a pure function: given the catalog, a candidate skill id/hash, any sticky skill from earlier turns, and an estimated input size, returns an allow/deny `Decision` with the alias, effort, and reason — checking stale hash, vendor price cliffs, and the row's `max_input` cap. No LiteLLM or network dependency. |
+| `policy/decide.py` | The routing policy itself, as a pure function: given the catalog, a candidate skill id/hash, any sticky skill from earlier turns, and an estimated input size, returns an allow/deny `Decision` with the alias, effort, and reason — checking for an unrecognized skill id, a stale hash, vendor price cliffs, and the row's `max_input` cap. No LiteLLM or network dependency. |
 | `policy/__init__.py` | Empty — makes `policy/` an importable Python package. |
