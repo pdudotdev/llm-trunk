@@ -24,8 +24,8 @@ A local reverse proxy sitting between Claude Code and Anthropic on `127.0.0.1:40
 
 ▫️ **Key characteristics:**
 - [x] **Skill-tagged routing** — sha256 of a skill's `SKILL.md` body is the routing identity, not a prompt classifier
-- [x] **Session stickiness, bounded** — a tagged route persists across a conversation without re-invoking every turn, but expires after 10 minutes idle or 30 minutes since the last real invocation, whichever comes first — closes the "invoke a high-tier skill once, then ride it for unrelated work" loophole
-- [x] **Untagged fallback** — anything unrecognized routes to the cheapest model, low effort
+- [x] **Session stickiness, bounded** — once a skill is invoked, later messages in that conversation inherit the same route without re-invoking every turn, until it **expires and reverts to `untagged`**: after 10 minutes idle, or 30 minutes since the last real invocation, whichever comes first — closes the "invoke a high-tier skill once, then ride it for unrelated work" loophole
+- [x] **Untagged fallback** — the route for a conversation turn where no skill was resolved: none invoked this turn, and no unexpired sticky route either (a brand-new conversation, one that never invoked a skill, or one whose sticky route just expired). Routes to the cheapest model, low effort
 - [x] **Deny levers** — stale hash, unrecognized skill id, oversized input, or a vendor price cliff all block the request before it reaches Anthropic
 - [x] **Multi-vendor ready** — the price-cliff check runs on every decision today (`vendor: anthropic` = no-op), ready for a non-Anthropic route
 - [x] **Local lab, not production** — one Mac, Docker Compose, no auth beyond LiteLLM's own keys
@@ -45,7 +45,7 @@ A local reverse proxy sitting between Claude Code and Anthropic on `127.0.0.1:40
 
 ▫️ **Every live request:**
 - [x] Claude Code POSTs to the proxy, invoking a skill or not
-- [x] A custom LiteLLM callback resolves the skill — headers → Claude Code's `<command-name>` tag (the real invocation path) → raw frontmatter (fallback, for pasted/`@`-referenced content) → sticky session → untagged
+- [x] A custom LiteLLM callback resolves the skill — headers → Claude Code's `<command-name>` tag (the real invocation path) → raw frontmatter (fallback, for pasted/`@`-referenced content) → sticky session (bounded — see [Overview](#-overview)) → untagged
 - [x] The resolved skill id + hash is checked against `catalog.yaml`
 - [x] **Allow** → model, effort, and `max_tokens` are overridden to the resolved route, regardless of what the client asked for
 - [x] **Deny** → unrecognized skill id, stale hash, oversized input, or a crossed vendor price cliff — the request never reaches Anthropic
@@ -129,7 +129,7 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 
 | File | Role |
 |---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers → `<command-name>` tag + `Base directory` marker (real path) → raw frontmatter (fallback) → sticky session → untagged — calls `decide()`, then denies or pins model/effort/`max_tokens` and remembers the skill for that conversation. Logs the outcome once Anthropic responds. |
+| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers → `<command-name>` tag + `Base directory` marker (real path) → raw frontmatter (fallback) → sticky session → untagged — calls `decide()`, then denies or pins model/effort/`max_tokens`. Remembers the skill for that conversation, but the entry expires after 10 minutes idle or 30 minutes since the last real invocation (whichever first), reverting later requests to `untagged`. Logs the outcome once Anthropic responds. |
 | [`policy/hash.py`](policy/hash.py) | `sha256_hex()` — the single hashing entry point, used by the callback (body hash + conversation fingerprint) and `scripts/hash_skill.py`. `strip_frontmatter()`, used only by `scripts/hash_skill.py` (the callback locates the body via a regex match's end position instead). |
 | [`policy/cliffs.py`](policy/cliffs.py) | Vendor input-size price-cliff thresholds (Grok/Gemini 200k, OpenAI Astra-class 272k). Called from `decide()` on every request — a no-op today since every row is `anthropic`, but live and ready for a non-Anthropic vendor. |
 | [`policy/decide.py`](policy/decide.py) | The routing policy, as a pure function: catalog + candidate skill id/hash + sticky skill + estimated input size → an allow/deny `Decision` with alias, effort, reason — checking for an unrecognized skill id, a stale hash, price cliffs, and the `max_input` cap. No LiteLLM or network dependency. |
