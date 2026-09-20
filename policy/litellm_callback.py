@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -22,6 +23,18 @@ def _log(message: str) -> None:
 CATALOG_PATH = "/app/catalog.yaml"
 MAX_STICKY_SESSIONS = 1024
 MAX_FRONTMATTER = 4096
+
+# Bounds how long a route can ride on one invocation. Without this, any
+# later message in the same conversation -- however unrelated -- keeps
+# inheriting the tagged route forever: invoke a high-tier skill once, then
+# use that conversation for anything else at that skill's price. Two
+# independent limits, whichever elapses first evicts the entry back to "no
+# sticky route" (decide() then falls through to untagged, same as if the
+# skill had never been invoked).
+STICKY_IDLE_TIMEOUT_SECONDS = 600  # expires if unused this long
+STICKY_MAX_AGE_SECONDS = 1800  # hard cap since the last real invocation --
+# not extended by continued sticky-only use, so periodically pinging the
+# conversation can't keep a route alive past this.
 
 # The bounded quantifier matters: with an unbounded `.*?` a failed match
 # backtracks to end-of-text at every "---" in the payload (markdown rules,
@@ -141,7 +154,8 @@ def _extract_skill(texts: list[str], catalog: dict) -> tuple[str, str] | None:
 class SkillRoutingCallback(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
-        self._sticky: OrderedDict[str, str] = OrderedDict()
+        # session_key -> (skill_id, first_invoked_at, last_used_at)
+        self._sticky: OrderedDict[str, tuple[str, float, float]] = OrderedDict()
 
     def _session_key(self, user_api_key_dict, data: dict, headers: dict) -> str:
         key = (
@@ -166,8 +180,27 @@ class SkillRoutingCallback(CustomLogger):
             conversation = sha256_hex(first_user.encode())
         return f"{key}:{conversation}"
 
-    def _set_sticky(self, session_key: str, skill_id: str) -> None:
-        self._sticky[session_key] = skill_id
+    def _get_sticky(self, session_key: str) -> str | None:
+        entry = self._sticky.get(session_key)
+        if entry is None:
+            return None
+        skill_id, first_invoked_at, last_used_at = entry
+        now = time.monotonic()
+        if now - last_used_at > STICKY_IDLE_TIMEOUT_SECONDS:
+            del self._sticky[session_key]
+            _log(f"llm-trunk: sticky route for {skill_id!r} expired (idle)")
+            return None
+        if now - first_invoked_at > STICKY_MAX_AGE_SECONDS:
+            del self._sticky[session_key]
+            _log(f"llm-trunk: sticky route for {skill_id!r} expired (max-age)")
+            return None
+        return skill_id
+
+    def _touch_sticky(self, session_key: str, skill_id: str, *, reinvoked: bool) -> None:
+        now = time.monotonic()
+        existing = self._sticky.get(session_key)
+        first_invoked_at = now if (reinvoked or existing is None) else existing[1]
+        self._sticky[session_key] = (skill_id, first_invoked_at, now)
         self._sticky.move_to_end(session_key)
         while len(self._sticky) > MAX_STICKY_SESSIONS:
             self._sticky.popitem(last=False)
@@ -203,7 +236,7 @@ class SkillRoutingCallback(CustomLogger):
             if extracted:
                 skill_id, skill_hash = extracted
 
-        sticky_skill_id = self._sticky.get(session_key)
+        sticky_skill_id = self._get_sticky(session_key)
         estimated_input_tokens = self._estimate_input_tokens(
             data.get("model", ""), messages, texts
         )
@@ -218,7 +251,7 @@ class SkillRoutingCallback(CustomLogger):
 
         effective_skill_id = skill_id or sticky_skill_id
         if effective_skill_id is not None:
-            self._set_sticky(session_key, effective_skill_id)
+            self._touch_sticky(session_key, effective_skill_id, reinvoked=skill_id is not None)
 
         data["model"] = decision.alias
         # LiteLLM's normalized reasoning parameter; it translates this into the

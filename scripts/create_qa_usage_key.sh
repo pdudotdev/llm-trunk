@@ -12,9 +12,17 @@ set +a
 # (e.g. claude-sonnet-5), never one of our alias names. Restricting this key
 # to the alias names blocks every real request at the gate. Access control
 # is decide()'s job, not this key's.
+#
+# max_budget/budget_duration are an orthogonal backstop, independent of
+# routing: even if the sticky-route abuse case in litellm_callback.py were
+# never found, this caps total spend per key per period regardless. Purely
+# a LiteLLM feature -- adjust the numbers for your own usage, no code
+# changes needed elsewhere.
 curl -s -X POST "http://127.0.0.1:4000/key/generate" \
   -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
-    "metadata": {"name": "qa-usage"}
+    "metadata": {"name": "qa-usage"},
+    "max_budget": 50,
+    "budget_duration": "30d"
   }'

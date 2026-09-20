@@ -24,7 +24,7 @@ A local reverse proxy sitting between Claude Code and Anthropic on `127.0.0.1:40
 
 ▫️ **Key characteristics:**
 - [x] **Skill-tagged routing** — sha256 of a skill's `SKILL.md` body is the routing identity, not a prompt classifier
-- [x] **Session stickiness** — a tagged route persists for the rest of that conversation, no re-invoking every turn
+- [x] **Session stickiness, bounded** — a tagged route persists across a conversation without re-invoking every turn, but expires after 10 minutes idle or 30 minutes since the last real invocation, whichever comes first — closes the "invoke a high-tier skill once, then ride it for unrelated work" loophole
 - [x] **Untagged fallback** — anything unrecognized routes to the cheapest model, low effort
 - [x] **Deny levers** — stale hash, unrecognized skill id, oversized input, or a vendor price cliff all block the request before it reaches Anthropic
 - [x] **Multi-vendor ready** — the price-cliff check runs on every decision today (`vendor: anthropic` = no-op), ready for a non-Anthropic route
@@ -122,7 +122,7 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 | [`catalog.yaml`](catalog.yaml) | The routing table — one row per skill (sha256, bytes, bucket, alias, vendor, effort, caps) plus `untagged`. `sha256`/`bytes` describe the *body* (frontmatter stripped), the only part Claude Code sends verbatim. `vendor` drives `decide()`'s price-cliff check (a no-op until a non-Anthropic route exists). |
 | [`docker-compose.yml`](docker-compose.yml) | Brings up `postgres` (spend/key storage) and `litellm` (the proxy), mounting `litellm/config.yaml`, `policy/`, and `catalog.yaml` into the container. |
 | [`litellm/config.yaml`](litellm/config.yaml) | LiteLLM's own config: `model_list` (alias → real model + pricing), the `callbacks` entry registering our routing policy, and `general_settings` (master key, database URL). |
-| [`scripts/create_qa_usage_key.sh`](scripts/create_qa_usage_key.sh) | Mints the `qa-usage` virtual key via LiteLLM's `/key/generate`. Deliberately unrestricted — LiteLLM checks a key's model allow-list against the client's *original* model, before the callback rewrites it, so restricting it blocks every real request. `decide()` is the actual access control. |
+| [`scripts/create_qa_usage_key.sh`](scripts/create_qa_usage_key.sh) | Mints the `qa-usage` virtual key via LiteLLM's `/key/generate`. Deliberately unrestricted on `models` — LiteLLM checks a key's model allow-list against the client's *original* model, before the callback rewrites it, so restricting it blocks every real request. `decide()` is the actual access control. Sets `max_budget`/`budget_duration` as an independent spend cap, orthogonal to routing. |
 | [`client-settings.json.example`](client-settings.json.example) | Template for `<your-client-repo>/.claude/settings.json` — the `env` block pointing Claude Code at the gateway. `company-client`'s own copy is local-only, so this is what any other adopter works from. |
 
 ▫️ **Per-request phase:**
