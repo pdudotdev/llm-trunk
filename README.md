@@ -6,6 +6,8 @@
 
 Skill-tagged routing gateway for Claude Code, built on [LiteLLM](https://docs.litellm.ai/). Routes traffic to a specific Anthropic model + effort level based on which QA skill was invoked — identified by the sha256 hash of that skill's `SKILL.md` body, not a prompt classifier.
 
+If you work with switches, this project's behavior mirrors an 802.1Q trunk port. A trunk carries multiple VLANs over one physical link: each Ethernet frame either carries an explicit VLAN tag, or arrives untagged and gets silently assigned to whatever native VLAN the port defaults to. llm-trunk does the same for LLM traffic — every Claude Code request either carries a verifiable tag (the sha256 of the invoked skill's `SKILL.md`, playing the role of the VLAN ID) that routes it down that skill's specific model/effort lane, or it arrives with no tag and falls back to the native lane: the cheap `untagged` route (Haiku, low effort). `catalog.yaml` is the trunk's allowed-VLAN list — a tag the trunk doesn't recognize (an unknown skill id, or one whose hash doesn't match) gets the frame dropped at the port instead of forwarded, same as a VLAN tag outside a trunk's configured allow-list.
+
 ## 📖 **Table of Contents**
 - 🔀 **llm-trunk**
   - [🔭 Overview](#-overview)
