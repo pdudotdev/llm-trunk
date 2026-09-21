@@ -54,6 +54,9 @@ STICKY_MAX_AGE_SECONDS = 1800  # hard cap since the last real invocation --
 # never appears on the wire for a skill invoked this way.
 COMMAND_NAME_RE = re.compile(r"<command-name>/(?P<name>[\w-]+)</command-name>")
 BASE_DIR_RE = re.compile(r"Base directory for this skill: [^\n]*\n\n")
+# The only thing Claude Code puts after the body, in the body's own content
+# block: this line when the skill was invoked with arguments, else nothing.
+ARGUMENTS_MARKER = "\n\nARGUMENTS: "
 
 DENY_STATUS = {
     UNKNOWN_SKILL: 403,
@@ -138,7 +141,7 @@ def _fold_system_messages(messages: list[dict]) -> list[dict]:
     return folded
 
 
-def _latest_user_text(data: dict) -> str:
+def _latest_user_blocks(data: dict) -> list[str]:
     # Claude Code resends the full conversation on every turn, so scanning
     # every message for a skill invocation finds a stale one from an earlier
     # turn and treats it as live -- pinning the route forever (stickiness
@@ -146,11 +149,16 @@ def _latest_user_text(data: dict) -> str:
     # skills (the older, no-longer-relevant block wins first-match). Only the
     # newest user turn can contain *this* turn's real invocation; anything
     # not found there correctly falls through to the sticky path instead,
-    # where it belongs.
+    # where it belongs. Kept as separate content blocks, not joined: the
+    # body's end is checked against the end of its own block.
     for message in reversed(data.get("messages", [])):
         if message.get("role") == "user":
-            return _message_text(message.get("content"))
-    return ""
+            return [
+                block.get("text", "")
+                for block in _content_blocks(message.get("content"))
+                if isinstance(block, dict)
+            ]
+    return []
 
 
 def _usage_value(usage, *names):
@@ -161,33 +169,49 @@ def _usage_value(usage, *names):
     return None
 
 
-def _hash_body(text: str, start: int, row: dict, name: str) -> tuple[str, str] | None:
+def _hash_body(block: str, start: int, row: dict, name: str) -> tuple[str, str] | None:
     length = row.get("bytes")
     if length is None:
         _log(f"llm-trunk: catalog row {name!r} has no 'bytes', cannot verify its hash")
         return None
     # The catalog records the canonical body's byte length so the exact
-    # region can be isolated from whatever prompt text surrounds it; hashing
-    # to end-of-message would never match the stored digest.
-    raw = text[start : start + length].encode()[:length]
+    # region can be isolated from the ARGUMENTS line that may follow it.
+    raw = block[start : start + length].encode()[:length]
+    end = start + len(raw.decode(errors="ignore"))
+    # The body must also *end* there: lines appended to the skill file since
+    # it was hashed sit past the catalog's length and would otherwise pass
+    # unverified. Hash through the end of the block instead, so the extra
+    # content makes the digest mismatch and the request is denied as stale.
+    rest = block[end:]
+    if rest and not rest.startswith(ARGUMENTS_MARKER):
+        raw = block[start:].encode()
     return name, sha256_hex(raw)
 
 
-def _extract_skill(text: str, catalog: dict) -> tuple[str, str] | None:
+def _find_body(blocks: list[str], index: int, offset: int, row: dict, name: str):
+    # The body follows its tag: in a later block of the same turn (how
+    # Claude Code sends it today), or further along the same block.
+    for block in blocks[index:]:
+        base_dir_match = BASE_DIR_RE.search(block, offset)
+        if base_dir_match:
+            return _hash_body(block, base_dir_match.end(), row, name)
+        offset = 0
+    return None
+
+
+def _extract_skill(blocks: list[str], catalog: dict) -> tuple[str, str] | None:
     skills = catalog.get("skills", {})
     # Every tag, not just the first: another slash command's tag earlier in
     # the same turn (e.g. /model) must not hide a later skill invocation.
-    for match in COMMAND_NAME_RE.finditer(text):
-        name = match.group("name")
-        row = skills.get(name)
-        if row is None:
-            continue
-        base_dir_match = BASE_DIR_RE.search(text, match.end())
-        if base_dir_match is None:
-            continue
-        found = _hash_body(text, base_dir_match.end(), row, name)
-        if found:
-            return found
+    for index, block in enumerate(blocks):
+        for match in COMMAND_NAME_RE.finditer(block):
+            name = match.group("name")
+            row = skills.get(name)
+            if row is None:
+                continue
+            found = _find_body(blocks, index, match.end(), row, name)
+            if found:
+                return found
     return None
 
 
@@ -315,10 +339,10 @@ class SkillRoutingCallback(CustomLogger):
 
         # An id without a hash is an unverified client claim, so both headers
         # are required together; otherwise fall through to body extraction,
-        # scoped to only the newest user turn (see _latest_user_text).
+        # scoped to only the newest user turn (see _latest_user_blocks).
         if not (skill_id and skill_hash):
             skill_id = skill_hash = None
-            extracted = _extract_skill(_latest_user_text(data), catalog)
+            extracted = _extract_skill(_latest_user_blocks(data), catalog)
             if extracted:
                 skill_id, skill_hash = extracted
 

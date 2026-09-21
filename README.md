@@ -20,6 +20,7 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
 - 🔀 **llm-trunk**
   - [🔭 Overview](#-overview)
   - [🔀 How It Works](#-how-it-works)
+  - [🧪 Example Session](#-example-session)
   - [🚀 Installation & Usage](#-installation--usage)
   - [📂 Project Files](#-project-files)
   - [⬆️ Planned Upgrades](#️-planned-upgrades)
@@ -59,6 +60,25 @@ A local reverse proxy sitting between Claude Code and Anthropic on `127.0.0.1:40
 - [x] **Allow** → model, effort, and `max_tokens` are overridden to the resolved route, regardless of what the client asked for (Claude Code's own `/effort` choice is dropped). Mid-conversation `system` messages, which Claude Code sends when it thinks the model supports them, are folded into the adjacent user turn - Haiku 4.5 rejects them
 - [x] **Deny** → stale hash, oversized input, or a crossed vendor price cliff — the request never reaches Anthropic
 - [x] Once Anthropic responds, skill/alias/effort/tokens/cost get logged, for routed-vs-unrouted bill comparisons
+
+## 🧪 Example Session
+
+▫️ A real run of Claude Code in `company-client` through the gateway. Each row is one step; the decision is what the gateway logged for it.
+
+| # | What the user does | Gateway decision |
+|---|---|---|
+| 1 | Asks a plain question in a new session | `untagged` → Haiku 4.5, low |
+| 2 | Runs `/qa-test-plan-creation` | hash verified → Opus 5, high |
+| 3 | Asks a follow-up, no skill | sticky → stays on Opus 5, high |
+| 4 | Runs `/qa-bug-logging` in the same session | hash verified → switches to Sonnet 5, low |
+| 5 | Runs `/qa-test-case-execution` | hash verified → Sonnet 5, medium |
+| 6 | Runs `/qa-fix-verification` | hash verified → Haiku 4.5, low |
+| 7 | Starts a new session, `@`-references a file | `untagged` — nothing carried over from the old session |
+| 8 | Changes a word inside a skill, then runs it | **403** stale hash — never reaches Anthropic |
+| 9 | Appends a line to a skill, then runs it | **403** stale hash — never reaches Anthropic |
+| 10 | Pastes a ~200 KB log into an untagged session | **413** input cap (~93k estimated ≥ 64k) — never reaches Anthropic |
+
+> ⚠️ **NOTE:** Switching lanes costs one uncached turn (~$0.13 vs ~$0.03 for a cached Sonnet/Opus turn here) — Anthropic's prompt cache doesn't carry across a model or effort change. Claude Code shows any 413 as its own "Request too large (max 32MB)…" message; the real reason is in the gateway log.
 
 ## 🚀 Installation & Usage
 
@@ -121,7 +141,7 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 
 | File | Role |
 |---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers (only honored from a key whose metadata has `trust_skill_headers: true`; none do today) → `<command-name>` tag + `Base directory` marker, scanned only in the newest user message (older turns are ignored so a stale invocation can't override a switch or block stickiness from ever being reached) → sticky session → untagged. Whatever's resolved is then filtered against the calling key's `allowed_skills` (if set; a malformed value restricts the key to `untagged`) *before* `decide()` sees it — a claim for a skill outside the key's list is cleared and falls through to `untagged`, regardless of how convincingly it was forged. Estimates input size over system prompt + messages + tool definitions. `decide()` then denies or pins model/effort/`max_tokens`. Remembers the skill per Claude Code session (its `session_id`), but the entry expires after 10 minutes idle or 30 minutes since the last real invocation (whichever first), reverting later requests to `untagged`. Logs the outcome — estimated vs real input tokens included — once Anthropic responds. |
+| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers (only honored from a key whose metadata has `trust_skill_headers: true`; none do today) → `<command-name>` tag + `Base directory` marker, scanned only in the newest user message (older turns are ignored so a stale invocation can't override a switch or block stickiness from ever being reached) → sticky session → untagged. The body is hashed over exactly the catalog's `bytes`, and must end there (only Claude Code's own `ARGUMENTS:` line may follow) — so any edit to a skill, appended lines included, is denied as a stale hash until it's re-hashed. Whatever's resolved is then filtered against the calling key's `allowed_skills` (if set; a malformed value restricts the key to `untagged`) *before* `decide()` sees it — a claim for a skill outside the key's list is cleared and falls through to `untagged`, regardless of how convincingly it was forged. Estimates input size over system prompt + messages + tool definitions. `decide()` then denies or pins model/effort/`max_tokens`. Remembers the skill per Claude Code session (its `session_id`), but the entry expires after 10 minutes idle or 30 minutes since the last real invocation (whichever first), reverting later requests to `untagged`. Logs the outcome — estimated vs real input tokens included — once Anthropic responds. |
 | [`policy/hash.py`](policy/hash.py) | `sha256_hex()` — the single hashing entry point, used by the callback (body hash + fallback conversation fingerprint) and `scripts/hash_skill.py`. `strip_frontmatter()` (BOM- and CRLF-aware, matching what Claude Code strips) and the substitution check, used only by `scripts/hash_skill.py` (the callback locates the body via a regex match's end position instead). |
 | [`policy/cliffs.py`](policy/cliffs.py) | Vendor input-size price-cliff thresholds (Grok/Gemini 200k, OpenAI Astra-class 272k). Called from `decide()` on every request — a no-op today since every row is `anthropic`, but live and ready for a non-Anthropic vendor. |
 | [`policy/decide.py`](policy/decide.py) | The routing policy, as a pure function: catalog + candidate skill id/hash + sticky skill + estimated input size → an allow/deny `Decision` with alias, effort, reason — checking for a stale hash, price cliffs, and the `max_input` cap (plus an unknown skill id, reachable only via trusted headers). No LiteLLM or network dependency. |
