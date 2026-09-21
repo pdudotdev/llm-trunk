@@ -74,11 +74,11 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 | 5 | Runs `/qa-test-case-execution` | hash verified → Sonnet 5, medium |
 | 6 | Runs `/qa-fix-verification` | hash verified → Haiku 4.5, low |
 | 7 | Starts a new session, `@`-references a file | `untagged` — nothing carried over from the old session |
-| 8 | Changes a word inside a skill, then runs it | **403** stale hash — never reaches Anthropic |
-| 9 | Appends a line to a skill, then runs it | **403** stale hash — never reaches Anthropic |
-| 10 | Pastes a ~200 KB log into an untagged session | **413** input cap (~93k estimated ≥ 64k) — never reaches Anthropic |
+| 8 | Changes a word inside a skill, then runs it | **422** stale hash — never reaches Anthropic |
+| 9 | Appends a line to a skill, then runs it | **422** stale hash — never reaches Anthropic |
+| 10 | Pastes a ~200 KB log into an untagged session | **422** input cap (~89k estimated ≥ 64k) — never reaches Anthropic |
 
-> ⚠️ **NOTE:** Switching lanes costs one uncached turn (~$0.13 vs ~$0.03 for a cached Sonnet/Opus turn here) — Anthropic's prompt cache doesn't carry across a model or effort change. Claude Code shows any 413 as its own "Request too large (max 32MB)…" message; the real reason is in the gateway log.
+> ⚠️ **NOTE:** Switching lanes costs one uncached turn (~$0.13 vs ~$0.03 for a cached Sonnet/Opus turn here) — Anthropic's prompt cache doesn't carry across a model or effort change. Every deny is a 422 whose message Claude Code shows as-is, e.g. `API Error: 422 llm-trunk: ~89409 input tokens exceeds the untagged lane cap (64000) — run /compact or start a new session`.
 
 ## 🚀 Installation & Usage
 

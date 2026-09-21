@@ -37,26 +37,33 @@ def decide(
     else:
         row = catalog["skills"].get(effective_skill_id)
         if row is None:
-            return _deny(UNKNOWN_SKILL, f"unknown skill_id: {effective_skill_id}")
+            return _deny(
+                UNKNOWN_SKILL, f"llm-trunk: skill {effective_skill_id!r} is not in catalog.yaml"
+            )
         if skill_hash is not None and skill_hash != row["sha256"]:
             return _deny(
                 STALE_HASH,
-                f"stale skill hash for {effective_skill_id}: "
-                f"got {skill_hash}, catalog has {row['sha256']}",
+                f"llm-trunk: skill {effective_skill_id!r} changed since it was hashed "
+                f"(got {skill_hash[:12]}, catalog has {row['sha256'][:12]}) — "
+                "re-run scripts/hash_skill.py and update catalog.yaml",
             )
         label = f"tagged:{effective_skill_id}"
 
+    # Reasons are shown to the user by Claude Code, so each says what to do.
+    lane = effective_skill_id or "untagged"
     vendor = row.get("vendor")
     if crosses_vendor_cliff(vendor, estimated_input_tokens):
         return _deny(
             PRICE_CLIFF,
-            f"vendor price cliff crossed for {vendor} at {estimated_input_tokens} tokens",
+            f"llm-trunk: ~{estimated_input_tokens} input tokens crosses the {vendor} "
+            "price cliff — run /compact or start a new session",
         )
 
     if estimated_input_tokens >= row["max_input"]:
         return _deny(
             INPUT_CAP,
-            f"estimated input {estimated_input_tokens} >= max_input {row['max_input']} for {label}",
+            f"llm-trunk: ~{estimated_input_tokens} input tokens exceeds the {lane} lane cap "
+            f"({row['max_input']}) — run /compact or start a new session",
         )
 
     return Decision(

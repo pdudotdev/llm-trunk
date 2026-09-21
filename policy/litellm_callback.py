@@ -8,7 +8,7 @@ import yaml
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
-from policy.decide import INPUT_CAP, PRICE_CLIFF, STALE_HASH, UNKNOWN_SKILL, decide
+from policy.decide import decide
 from policy.hash import sha256_hex
 
 
@@ -32,7 +32,7 @@ MAX_STICKY_SESSIONS = 1024
 # (different tokenizers); 3 lands within ~15% of both.
 CHARS_PER_TOKEN = 3
 # Base64 image/PDF payloads are billed by content, not encoded length --
-# counting their characters would 413 any screenshot.
+# counting their characters would deny any screenshot.
 MEDIA_BLOCK_TOKENS = 1600
 
 # Bounds how long a route can ride on one invocation. Without this, any
@@ -58,12 +58,10 @@ BASE_DIR_RE = re.compile(r"Base directory for this skill: [^\n]*\n\n")
 # block: this line when the skill was invoked with arguments, else nothing.
 ARGUMENTS_MARKER = "\n\nARGUMENTS: "
 
-DENY_STATUS = {
-    UNKNOWN_SKILL: 403,
-    STALE_HASH: 403,
-    INPUT_CAP: 413,
-    PRICE_CLIFF: 413,
-}
+# One status for every policy deny. Claude Code shows a 422's message as-is;
+# it replaces any 413 with its own "Request too large (max 32MB)" text and
+# prefixes a 403 with "Failed to authenticate", hiding the real reason.
+DENY_STATUS = 422
 
 
 def _load_catalog() -> dict:
@@ -397,9 +395,7 @@ class SkillRoutingCallback(CustomLogger):
 
         if decision.action == "deny":
             _log(f"llm-trunk deny [{decision.code}]: {decision.reason}")
-            raise HTTPException(
-                status_code=DENY_STATUS.get(decision.code, 403), detail=decision.reason
-            )
+            raise HTTPException(status_code=DENY_STATUS, detail=decision.reason)
 
         effective_skill_id = skill_id or sticky_skill_id
         if effective_skill_id is not None:
