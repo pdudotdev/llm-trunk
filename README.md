@@ -4,17 +4,17 @@
 [![License](https://img.shields.io/badge/license-GPLv3-1a1a2e)](LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/pdudotdev/llm-trunk?color=1a1a2e)](https://github.com/pdudotdev/llm-trunk/commits/master/)
 
-Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Routes traffic to a specific model + effort level based on which skill was invoked - identified by the sha256 hash of that skill's `SKILL.md` body, not a prompt classifier.
+Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Routes each request to a model + effort level based on which skill was invoked — identified by the sha256 hash of that skill's `SKILL.md` body, not a prompt classifier.
 
 ▫️ **Same idea as an 802.1Q trunk port:**
-- [x] **Tagged frame** → VLAN ID routes it down that VLAN. Here: skill hash → routes down that skill's model/effort lane
-- [x] **Untagged frame** → falls back to the native VLAN. Here: falls back to `untagged` (e.g. Haiku, low effort)
-- [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml` - a slash command not in it (e.g. `/compact`, a personal skill) gets no lane of its own and rides `untagged`
+- [x] **Tagged frame** → the VLAN ID picks the VLAN. Here: the skill hash picks that skill's model/effort lane
+- [x] **Untagged frame** → goes to the native VLAN. Here: goes to `untagged` (Haiku, low effort)
+- [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml` — a slash command not in it (e.g. `/compact`, a personal skill) rides `untagged`
 
 ▫️ **"VLAN hopping" protection:**
-- [x] Can't fake owning a tag — wrong hash for a skill id gets dropped
-- [x] Headers can't self-assert one — `x-skill-id`/`x-skill-hash` are only honored from a key explicitly flagged for it (`metadata: {"trust_skill_headers": true}`); no key is flagged today
-- [x] Nor can a forged body — the tag isn't a secret (it's a hash of files every employee can read), so a hand-crafted `<command-name>` block with the real file bytes hashes correctly too. Closed the same way real VLAN hopping is: not by hiding the tag, but by checking what each *port* (key) is actually allowed to carry — `allowed_skills` in a key's `metadata` is checked before routing, downgrading to `untagged` if the claimed skill isn't on it. Today's single `qa-usage` key is intentionally unrestricted (it legitimately needs every skill), so this isn't yet an active boundary for that key — it becomes one the moment a second, narrower-scoped key exists
+- [x] Can't fake a tag — a wrong hash for a skill is denied
+- [x] Headers can't claim one — `x-skill-id`/`x-skill-hash` are only honored from a key with `metadata: {"trust_skill_headers": true}`; no key has it today
+- [x] A forged body is handled per key, like per-port VLAN filtering — the hash isn't secret (anyone can read the skill files), so each key's `allowed_skills` metadata decides which lanes it can reach; anything else drops to `untagged`. The single `qa-usage` key is unrestricted on purpose (it needs every QA skill), so this becomes an active boundary once a narrower key exists
 
 ## 📖 **Table of Contents**
 - 🔀 **llm-trunk**
@@ -30,40 +30,40 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
 
 ## 🔭 Overview
 
-A local reverse proxy sitting between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM does the actual proxying; this repo owns only the **routing policy** — which model and effort level a request gets, based on which QA skill (if any) was invoked.
+A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM does the proxying; this repo owns only the **routing policy** — which model and effort level a request gets, based on which QA skill (if any) was invoked.
 
 ▫️ **Key characteristics:**
-- [x] **Skill-tagged routing** — sha256 of a skill's `SKILL.md` body is the routing identity, not a prompt classifier
-- [x] **Session stickiness, bounded** — once a skill is invoked, later messages in that Claude Code session inherit the same route without re-invoking every turn, until it **expires and reverts to `untagged`**: after 10 minutes idle, or 30 minutes since the last real invocation, whichever comes first. This stops "invoke a high-tier skill once, then ride it for unrelated work". It can't stop someone re-typing `/qa-test-plan-creation` before every unrelated question - the gateway can't tell that apart from real use, so the key's budget cap is the backstop there
-- [x] **Untagged fallback** — the route for a conversation turn where no skill was resolved: none invoked this turn, and no unexpired sticky route either (a brand-new conversation, one that never invoked a skill, or one whose sticky route just expired). Routes to the cheapest model, low effort
-- [x] **Deny levers** — a stale hash, oversized input (per-lane `max_input`, counted over system prompt + messages + tool definitions), or a vendor price cliff blocks the request before it reaches Anthropic
-- [x] **Multi-vendor ready** — the price-cliff check runs on every decision today (`vendor: anthropic` = no-op), ready for a non-Anthropic route
+- [x] **Skill-tagged routing** — the sha256 of a skill's `SKILL.md` body is the routing identity
+- [x] **Bounded stickiness** — after a skill is invoked, later messages in the same Claude Code session keep its route until it expires: 10 minutes idle, or 30 minutes since the last invocation, whichever comes first. This stops "invoke a pricey skill once, then use it for everything". It can't stop someone re-typing the skill before every question — the key's budget cap is the backstop there
+- [x] **Untagged fallback** — used when no skill is resolved: none invoked this turn and no live sticky route. Cheapest model, low effort
+- [x] **Deny rules** — a stale hash, oversized input (per-lane `max_input`, counting system prompt + messages + tool definitions), or a vendor price cliff blocks the request before it reaches Anthropic
+- [x] **Multi-vendor ready** — the price-cliff check runs on every request (a no-op for `vendor: anthropic`)
 - [x] **Local lab, not production** — one Mac, Docker Compose, no auth beyond LiteLLM's own keys
 
 ▫️ **Model tiers:**
 - [x] Opus 5 — test-plan creation
 - [x] Sonnet 5 — test execution, bug logging
-- [x] Haiku 4.5 — fix verification, untagged fallback
+- [x] Haiku 4.5 — fix verification, untagged
 
 ## 🔀 How It Works
 
 ▫️ **One-time setup:**
-- [x] Each skill's `SKILL.md` body (frontmatter stripped) gets sha256-hashed — [`scripts/hash_skill.py`](scripts/hash_skill.py)
-- [x] Hash + bucket + alias + effort + token caps recorded per skill in [`catalog.yaml`](catalog.yaml) — the single routing table
-- [x] Docker Compose brings up LiteLLM + Postgres, loading `litellm/config.yaml` (model list, pricing, callback registration)
-- [x] A budget-capped virtual key is minted via LiteLLM's own admin API — the client never sees the real Anthropic key
+- [x] Each skill's `SKILL.md` body (frontmatter stripped) is sha256-hashed — [`scripts/hash_skill.py`](scripts/hash_skill.py)
+- [x] Hash, lane, effort and token caps go into [`catalog.yaml`](catalog.yaml) — the routing table
+- [x] Docker Compose starts LiteLLM + Postgres, loading `litellm/config.yaml` (models, pricing, callback)
+- [x] A budget-capped virtual key is minted via LiteLLM's admin API — the client never sees the real Anthropic key
 
-▫️ **Every live request:**
-- [x] Claude Code POSTs to the proxy, invoking a skill or not
-- [x] A custom LiteLLM callback resolves the skill — headers → Claude Code's `<command-name>` tag, scanned **only in the newest user turn** (the real invocation path) → sticky session (bounded — see [Overview](#-overview)) → untagged. Claude Code resends the full conversation every turn, so scanning older turns too would find a stale invocation and treat it as live — pinning the route forever and making it impossible to switch skills
-- [x] The resolved skill id + hash is checked against `catalog.yaml`
-- [x] **Allow** → model, effort, and `max_tokens` are overridden to the resolved route, regardless of what the client asked for (Claude Code's own `/effort` choice is dropped). Mid-conversation `system` messages, which Claude Code sends when it thinks the model supports them, are folded into the adjacent user turn - Haiku 4.5 rejects them
-- [x] **Deny** → stale hash, oversized input, or a crossed vendor price cliff — the request never reaches Anthropic
-- [x] Once Anthropic responds, skill/alias/effort/tokens/cost get logged, for routed-vs-unrouted bill comparisons
+▫️ **Every request:**
+- [x] Claude Code sends the request to the proxy
+- [x] The callback resolves the skill, in order: trusted headers → a skill invoked in the **newest user turn** (a typed `/skill`, or Claude calling its `Skill` tool) → sticky route → `untagged`. Older turns are ignored, since Claude Code resends the whole conversation every turn
+- [x] The skill's hash is checked against `catalog.yaml`
+- [x] **Allow** → model, effort and `max_tokens` are set to the lane's values, whatever the client asked for (Claude Code's own `/effort` is dropped). Mid-conversation `system` messages are moved into the user turn, since Haiku 4.5 rejects them
+- [x] **Deny** → stale hash, oversized input or a vendor price cliff; the request never reaches Anthropic
+- [x] After Anthropic responds, skill, lane, effort, tokens and cost are logged
 
 ## 🧪 Example Session
 
-▫️ A real run of Claude Code in `company-client` through the gateway. Each row is one step; the decision is what the gateway logged for it.
+▫️ A real run of Claude Code in `company-client` through the gateway. The decision column is what the gateway logged.
 
 | # | What the user does | Gateway decision |
 |---|---|---|
@@ -93,7 +93,7 @@ git clone https://github.com/pdudotdev/llm-trunk
 cd llm-trunk
 cp .env.example .env
 ```
-Fill in `.env`: `LITELLM_MASTER_KEY` (any strong string), `ANTHROPIC_API_KEY` (the **routed-client** workspace key), and `POSTGRES_PASSWORD` (`openssl rand -hex 24` — must be URL-safe, see the comment in `.env.example`).
+Fill in `.env`: `LITELLM_MASTER_KEY` (any strong string), `ANTHROPIC_API_KEY` (the **routed-client** workspace key), and `POSTGRES_PASSWORD` (`openssl rand -hex 24` — must be URL-safe, see `.env.example`).
 
 ▫️ **Step 2 - Start the stack:**
 ```
@@ -111,18 +111,18 @@ Paste the printed `sha256`/`bytes` into `catalog.yaml` for each skill.
 ```
 ./scripts/create_qa_usage_key.sh
 ```
-Copy [`client-settings.json.example`](client-settings.json.example) to `<your-client-repo>/.claude/settings.json`, and paste the returned `key` in place of the placeholder `ANTHROPIC_AUTH_TOKEN`.
+Copy [`client-settings.json.example`](client-settings.json.example) to `<your-client-repo>/.claude/settings.json` and replace the placeholder `ANTHROPIC_AUTH_TOKEN` with the returned `key`.
 
 ▫️ **Step 5 - Test:**
 ```
 claude    # from your client repo — /your-skill-name to invoke a route
 ```
-Watch it land:
+Watch the decisions:
 ```
 docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 ```
 
-> ⚠️ **NOTE:** `catalog.yaml` is re-read on every request — edits apply immediately. Editing anything under `policy/` or `litellm/config.yaml` needs `docker compose restart litellm` (both are only loaded once, at startup).
+> ⚠️ **NOTE:** `catalog.yaml` is re-read on every request, so edits apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
 
 ## 📂 Project Files
 
@@ -130,26 +130,26 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 
 | File | Role |
 |---|---|
-| [`scripts/hash_skill.py`](scripts/hash_skill.py) | Strips frontmatter, prints the `sha256`/`bytes` of a skill's body for `catalog.yaml`. Rerun whenever a `SKILL.md` changes. Refuses a body using `$ARGUMENTS`, `$1`, `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}` or `` !`cmd` `` - Claude Code rewrites those at invocation time, so the hash could never match. |
-| [`catalog.yaml`](catalog.yaml) | The routing table — one row per skill (sha256, bytes, bucket, alias, vendor, effort, caps) plus `untagged`. `sha256`/`bytes` describe the *body* (frontmatter stripped), the only part Claude Code sends verbatim. `vendor` drives `decide()`'s price-cliff check (a no-op until a non-Anthropic route exists). |
-| [`docker-compose.yml`](docker-compose.yml) | Brings up `postgres` (spend/key storage) and `litellm` (the proxy), mounting `litellm/config.yaml`, `policy/`, and `catalog.yaml` into the container. LiteLLM is pinned by digest (1.102.0) - the callback relies on version-specific internals. |
-| [`litellm/config.yaml`](litellm/config.yaml) | LiteLLM's own config: `model_list` (alias → real model + pricing), the `callbacks` entry registering our routing policy, and `general_settings` (master key, database URL). |
-| [`scripts/create_qa_usage_key.sh`](scripts/create_qa_usage_key.sh) | Mints the `qa-usage` virtual key via LiteLLM's `/key/generate`. Deliberately unrestricted on `models` — LiteLLM checks a key's model allow-list against the client's *original* model, before the callback rewrites it, so restricting it blocks every real request. Per-skill access is `allowed_skills` in key metadata instead - omitted here, since the QA team needs every QA skill. Sets `max_budget`/`budget_duration` as an independent spend cap, orthogonal to routing. |
-| [`client-settings.json.example`](client-settings.json.example) | Template for `<your-client-repo>/.claude/settings.json` — the `env` block pointing Claude Code at the gateway. `company-client`'s own copy is local-only, so this is what any other adopter works from. |
+| [`scripts/hash_skill.py`](scripts/hash_skill.py) | Prints the `sha256`/`bytes` of a skill's body (frontmatter stripped) for `catalog.yaml`. Rerun whenever a `SKILL.md` changes. Refuses bodies using `$ARGUMENTS`, `$1`, `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}` or `` !`cmd` `` — Claude Code rewrites those when invoking, so the hash could never match. |
+| [`catalog.yaml`](catalog.yaml) | The routing table — one row per skill (sha256, bytes, bucket, alias, vendor, effort, caps) plus `untagged`. `vendor` drives the price-cliff check. |
+| [`docker-compose.yml`](docker-compose.yml) | Starts `postgres` (spend/key storage) and `litellm` (the proxy), mounting `litellm/config.yaml`, `policy/` and `catalog.yaml`. LiteLLM is pinned by digest (1.102.0), since the callback relies on version-specific internals. |
+| [`litellm/config.yaml`](litellm/config.yaml) | LiteLLM's config: `model_list` (alias → real model + pricing), the `callbacks` entry for the routing policy, and `general_settings` (master key, database URL). |
+| [`scripts/create_qa_usage_key.sh`](scripts/create_qa_usage_key.sh) | Mints the `qa-usage` virtual key with a budget cap (`max_budget`/`budget_duration`). No `models` restriction — LiteLLM checks it against the client's original model, before the callback rewrites it, so it would block every request. Per-skill access is `allowed_skills` in key metadata, omitted here since QA needs every QA skill. |
+| [`client-settings.json.example`](client-settings.json.example) | Template for `<your-client-repo>/.claude/settings.json` — points Claude Code at the gateway. |
 
 ▫️ **Per-request phase:**
 
 | File | Role |
 |---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The `CustomLogger` LiteLLM invokes on every request. Resolves the skill — headers (only honored from a key whose metadata has `trust_skill_headers: true`; none do today) → `<command-name>` tag + `Base directory` marker, scanned only in the newest user message (older turns are ignored so a stale invocation can't override a switch or block stickiness from ever being reached) → sticky session → untagged. The body is hashed over exactly the catalog's `bytes`, and must end there (only Claude Code's own `ARGUMENTS:` line may follow) — so any edit to a skill, appended lines included, is denied as a stale hash until it's re-hashed. Whatever's resolved is then filtered against the calling key's `allowed_skills` (if set; a malformed value restricts the key to `untagged`) *before* `decide()` sees it — a claim for a skill outside the key's list is cleared and falls through to `untagged`, regardless of how convincingly it was forged. Estimates input size over system prompt + messages + tool definitions. `decide()` then denies or pins model/effort/`max_tokens`. Remembers the skill per Claude Code session (its `session_id`), but the entry expires after 10 minutes idle or 30 minutes since the last real invocation (whichever first), reverting later requests to `untagged`. Logs the outcome — estimated vs real input tokens included — once Anthropic responds. |
-| [`policy/hash.py`](policy/hash.py) | `sha256_hex()` — the single hashing entry point, used by the callback (body hash + fallback conversation fingerprint) and `scripts/hash_skill.py`. `strip_frontmatter()` (BOM- and CRLF-aware, matching what Claude Code strips) and the substitution check, used only by `scripts/hash_skill.py` (the callback locates the body via a regex match's end position instead). |
-| [`policy/cliffs.py`](policy/cliffs.py) | Vendor input-size price-cliff thresholds (Grok/Gemini 200k, OpenAI Astra-class 272k). Called from `decide()` on every request — a no-op today since every row is `anthropic`, but live and ready for a non-Anthropic vendor. |
-| [`policy/decide.py`](policy/decide.py) | The routing policy, as a pure function: catalog + candidate skill id/hash + sticky skill + estimated input size → an allow/deny `Decision` with alias, effort, reason — checking for a stale hash, price cliffs, and the `max_input` cap (plus an unknown skill id, reachable only via trusted headers). No LiteLLM or network dependency. |
-| `policy/__init__.py` | Empty — makes `policy/` an importable Python package. |
+| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The LiteLLM callback run on every request. Resolves the skill (see [How It Works](#-how-it-works)); the body is hashed over exactly the catalog's `bytes` and must end there, so any edit — appended lines included — is denied as stale until re-hashed. Applies the key's `allowed_skills` (a malformed value restricts the key to `untagged`), estimates input size, calls `decide()`, then sets model/effort/`max_tokens`. Tracks sticky routes per Claude Code `session_id` with the 10/30-minute expiry. Logs the outcome, including estimated vs real input tokens. |
+| [`policy/hash.py`](policy/hash.py) | `sha256_hex()`, used by the callback and `scripts/hash_skill.py`. `strip_frontmatter()` (BOM- and CRLF-aware, like Claude Code) and the substitution check, used by `scripts/hash_skill.py`. |
+| [`policy/cliffs.py`](policy/cliffs.py) | Vendor price-cliff thresholds (Grok/Gemini 200k, OpenAI 272k). Checked by `decide()` on every request; a no-op for Anthropic. |
+| [`policy/decide.py`](policy/decide.py) | The routing policy as a pure function: catalog + skill id/hash + sticky skill + estimated input size → allow/deny with lane, effort and reason. Checks the hash, price cliffs and `max_input` (plus unknown skill ids, reachable only via trusted headers). No LiteLLM or network dependency. |
+| `policy/__init__.py` | Empty — makes `policy/` a Python package. |
 
 ## ⬆️ Planned Upgrades
-- [ ] Having two parallel LiteLLM processes running, with shared state via Redis
-- [ ] Non-Anthropic vendors added to `catalog.yaml`, exercising `policy/cliffs.py`
+- [ ] Two LiteLLM instances sharing sticky state via Redis
+- [ ] Non-Anthropic vendors in `catalog.yaml`, exercising `policy/cliffs.py`
 - [ ] Per-department virtual keys (`sk-dev-usage`), each scoped with `allowed_skills`
 
 ## 📄 Disclaimer

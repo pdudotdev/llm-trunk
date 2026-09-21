@@ -115,12 +115,18 @@ def _fold_system_messages(messages: list[dict]) -> list[dict]:
     # itself sends the same content to models without that support. Prefer
     # the preceding user turn; otherwise append to the following one, after
     # its blocks, since tool_result blocks must lead the turn after a
-    # tool_use.
+    # tool_use. Leading system messages are left alone: that's where
+    # OpenAI-format clients put their system prompt, which LiteLLM maps to
+    # Anthropic's top-level `system` -- folding it would demote it to user
+    # text.
     if not any(message.get("role") == "system" for message in messages):
         return messages
     folded: list[dict] = []
     pending: list = []
     for message in messages:
+        if message.get("role") == "system" and all(m.get("role") == "system" for m in folded):
+            folded.append(message)
+            continue
         if message.get("role") == "system":
             blocks = _content_blocks(message.get("content"))
             if folded and folded[-1].get("role") == "user" and not pending:
@@ -199,7 +205,28 @@ def _find_body(blocks: list[str], index: int, offset: int, row: dict, name: str)
     return None
 
 
-def _extract_skill(blocks: list[str], catalog: dict) -> tuple[str, str] | None:
+def _skill_tool_names(data: dict) -> list[str]:
+    # Claude invoking a skill on its own (its Skill tool, when a skill's
+    # description matches the request) sends no <command-name> tag: the name
+    # is in the assistant's tool_use, and the next user turn carries the
+    # same "Base directory" block + body + ARGUMENTS line as a slash command.
+    for message in reversed(data.get("messages", [])):
+        if message.get("role") == "assistant":
+            return [
+                block["input"]["skill"]
+                for block in _content_blocks(message.get("content"))
+                if isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == "Skill"
+                and isinstance(block.get("input"), dict)
+                and isinstance(block["input"].get("skill"), str)
+            ]
+    return []
+
+
+def _extract_skill(
+    blocks: list[str], catalog: dict, tool_names: list[str]
+) -> tuple[str, str] | None:
     skills = catalog.get("skills", {})
     # Every tag, not just the first: another slash command's tag earlier in
     # the same turn (e.g. /model) must not hide a later skill invocation.
@@ -212,6 +239,13 @@ def _extract_skill(blocks: list[str], catalog: dict) -> tuple[str, str] | None:
             found = _find_body(blocks, index, match.end(), row, name)
             if found:
                 return found
+    for name in tool_names:
+        row = skills.get(name)
+        if row is None:
+            continue
+        found = _find_body(blocks, 0, 0, row, name)
+        if found:
+            return found
     return None
 
 
@@ -342,7 +376,9 @@ class SkillRoutingCallback(CustomLogger):
         # scoped to only the newest user turn (see _latest_user_blocks).
         if not (skill_id and skill_hash):
             skill_id = skill_hash = None
-            extracted = _extract_skill(_latest_user_blocks(data), catalog)
+            extracted = _extract_skill(
+                _latest_user_blocks(data), catalog, _skill_tool_names(data)
+            )
             if extracted:
                 skill_id, skill_hash = extracted
 
