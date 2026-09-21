@@ -4,7 +4,7 @@ untagged:
   vendor: anthropic
   effort: low
   max_input: 64000
-  max_output: 1500
+  max_output: 4000
 
 skills:
   qa-test-plan-creation:
