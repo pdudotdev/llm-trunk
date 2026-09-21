@@ -10,8 +10,10 @@ set +a
 # allow-list against the CLIENT'S requested model, before our callback ever
 # runs to rewrite it -- and Claude Code always sends its own default model
 # (e.g. claude-sonnet-5), never one of our alias names. Restricting this key
-# to the alias names blocks every real request at the gate. Access control
-# is decide()'s job, not this key's.
+# to the alias names blocks every real request at the gate. Per-skill access
+# is metadata.allowed_skills instead (checked in litellm_callback.py's
+# _allowed_skills()); this key omits it on purpose, since the QA team
+# legitimately needs every QA skill.
 #
 # max_budget/budget_duration/tpm_limit/rpm_limit are an orthogonal backstop,
 # independent of routing/decide() -- pure LiteLLM key settings, no code
@@ -22,8 +24,6 @@ set +a
 # it without one), and model_rpm_limit/model_tpm_limit are silently
 # swallowed into inert metadata by this LiteLLM version instead of being
 # enforced (confirmed via /key/info -- no error, but no effect either).
-# Actual per-lane access control is allowed_skills below, enforced in
-# litellm_callback.py's _allowed_skills().
 curl -s -X POST "http://127.0.0.1:4000/key/generate" \
   -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
   -H "Content-Type: application/json" \

@@ -22,7 +22,18 @@ def _log(message: str) -> None:
 
 CATALOG_PATH = "/app/catalog.yaml"
 MAX_STICKY_SESSIONS = 1024
-MAX_FRONTMATTER = 4096
+
+# Input-size estimate: a plain character count over everything the model is
+# billed for -- system, messages AND tool definitions. litellm.token_counter
+# only sees `messages` and undercounts Anthropic-format blocks: live traffic
+# had ~52k-token requests estimated under a 16k cap. Claude Code's tool
+# definitions alone are ~21k tokens on every request. Calibrated on live
+# traffic: real counts ran ~3.3 chars/token on Haiku 4.5 and ~2.5 on Sonnet 5
+# (different tokenizers); 3 lands within ~15% of both.
+CHARS_PER_TOKEN = 3
+# Base64 image/PDF payloads are billed by content, not encoded length --
+# counting their characters would 413 any screenshot.
+MEDIA_BLOCK_TOKENS = 1600
 
 # Bounds how long a route can ride on one invocation. Without this, any
 # later message in the same conversation -- however unrelated -- keeps
@@ -35,11 +46,6 @@ STICKY_IDLE_TIMEOUT_SECONDS = 600  # expires if unused this long
 STICKY_MAX_AGE_SECONDS = 1800  # hard cap since the last real invocation --
 # not extended by continued sticky-only use, so periodically pinging the
 # conversation can't keep a route alive past this.
-
-# The bounded quantifier matters: with an unbounded `.*?` a failed match
-# backtracks to end-of-text at every "---" in the payload (markdown rules,
-# pasted diffs), which is O(text * fences) on the per-request hot path.
-FRONTMATTER_RE = re.compile(rf"---\n(.{{0,{MAX_FRONTMATTER}}}?)\n---\n\n?", re.DOTALL)
 
 # Claude Code's actual wire format for a slash-invoked project skill: the
 # YAML frontmatter is stripped client-side and replaced with this tag plus a
@@ -72,18 +78,64 @@ def _message_text(content: Any) -> str:
     return ""
 
 
-def _input_messages(data: dict) -> list[dict]:
-    """Single definition of what counts as request input: system, then messages."""
-    messages = []
-    system_text = _message_text(data.get("system"))
-    if system_text:
-        messages.append({"role": "system", "content": system_text})
-    messages.extend(data.get("messages", []))
-    return messages
+def _count_chars(node: Any) -> int:
+    if isinstance(node, str):
+        return len(node)
+    if isinstance(node, dict):
+        if node.get("type") == "base64":
+            return MEDIA_BLOCK_TOKENS * CHARS_PER_TOKEN
+        # Earlier turns' thinking blocks are stripped upstream, not billed.
+        if node.get("type") in ("thinking", "redacted_thinking"):
+            return 0
+        return sum(len(key) + _count_chars(value) for key, value in node.items())
+    if isinstance(node, list):
+        return sum(_count_chars(item) for item in node)
+    return 0 if node is None else len(str(node))
 
 
-def _candidate_texts(messages: list[dict]) -> list[str]:
-    return [_message_text(message.get("content")) for message in messages]
+def _estimate_input_tokens(data: dict) -> int:
+    billed = [data.get("system"), data.get("messages"), data.get("tools")]
+    return _count_chars(billed) // CHARS_PER_TOKEN
+
+
+def _content_blocks(content: Any) -> list:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return list(content) if isinstance(content, list) else []
+
+
+def _fold_system_messages(messages: list[dict]) -> list[dict]:
+    # Claude Code sends some context (e.g. @-referenced files) as a
+    # mid-conversation role:"system" message when it believes the model
+    # supports that -- but the routed model may not (Haiku 4.5 rejects it
+    # with a 400). Folding it into the adjacent user turn is how Claude Code
+    # itself sends the same content to models without that support. Prefer
+    # the preceding user turn; otherwise append to the following one, after
+    # its blocks, since tool_result blocks must lead the turn after a
+    # tool_use.
+    if not any(message.get("role") == "system" for message in messages):
+        return messages
+    folded: list[dict] = []
+    pending: list = []
+    for message in messages:
+        if message.get("role") == "system":
+            blocks = _content_blocks(message.get("content"))
+            if folded and folded[-1].get("role") == "user" and not pending:
+                previous = folded[-1]
+                folded[-1] = {**previous, "content": _content_blocks(previous.get("content")) + blocks}
+            else:
+                pending.extend(blocks)
+            continue
+        if pending:
+            if message.get("role") == "user":
+                message = {**message, "content": _content_blocks(message.get("content")) + pending}
+            else:
+                folded.append({"role": "user", "content": pending})
+            pending = []
+        folded.append(message)
+    if pending:
+        folded.append({"role": "user", "content": pending})
+    return folded
 
 
 def _latest_user_text(data: dict) -> str:
@@ -121,49 +173,37 @@ def _hash_body(text: str, start: int, row: dict, name: str) -> tuple[str, str] |
     return name, sha256_hex(raw)
 
 
-def _extract_from_command(text: str, catalog: dict) -> tuple[str, str] | None:
-    match = COMMAND_NAME_RE.search(text)
-    if match is None:
-        return None
-    name = match.group("name")
-    row = catalog.get("skills", {}).get(name)
-    if row is None:
-        return None
-    base_dir_match = BASE_DIR_RE.search(text, match.end())
-    if base_dir_match is None:
-        return None
-    return _hash_body(text, base_dir_match.end(), row, name)
-
-
-def _extract_from_frontmatter(text: str, catalog: dict) -> tuple[str, str] | None:
-    # Fallback for raw file content pasted or @-referenced directly (not via
-    # a slash command) -- there, the YAML frontmatter is still present
-    # verbatim, unlike the command-invocation path above.
+def _extract_skill(text: str, catalog: dict) -> tuple[str, str] | None:
     skills = catalog.get("skills", {})
-    for match in FRONTMATTER_RE.finditer(text):
-        try:
-            frontmatter = yaml.safe_load(match.group(1))
-        except yaml.YAMLError:
-            continue
-        # A stray "---" block in the prompt can parse to a scalar or list.
-        if not isinstance(frontmatter, dict):
-            continue
-        name = frontmatter.get("name")
+    # Every tag, not just the first: another slash command's tag earlier in
+    # the same turn (e.g. /model) must not hide a later skill invocation.
+    for match in COMMAND_NAME_RE.finditer(text):
+        name = match.group("name")
         row = skills.get(name)
         if row is None:
             continue
-        found = _hash_body(text, match.end(), row, name)
+        base_dir_match = BASE_DIR_RE.search(text, match.end())
+        if base_dir_match is None:
+            continue
+        found = _hash_body(text, base_dir_match.end(), row, name)
         if found:
             return found
     return None
 
 
-def _extract_skill(texts: list[str], catalog: dict) -> tuple[str, str] | None:
-    for text in texts:
-        found = _extract_from_command(text, catalog) or _extract_from_frontmatter(text, catalog)
-        if found:
-            return found
-    return None
+def _claude_code_session_id(data: dict) -> str | None:
+    # Claude Code sends metadata.user_id as a JSON string carrying a
+    # per-session UUID: stable across compaction and distinct between
+    # sessions, unlike a fingerprint of the first user message.
+    user_id = (data.get("metadata") or {}).get("user_id")
+    if not isinstance(user_id, str):
+        return None
+    try:
+        parsed = json.loads(user_id)
+    except ValueError:
+        return None
+    session_id = parsed.get("session_id") if isinstance(parsed, dict) else None
+    return session_id if isinstance(session_id, str) and session_id else None
 
 
 class SkillRoutingCallback(CustomLogger):
@@ -180,9 +220,11 @@ class SkillRoutingCallback(CustomLogger):
         )
         # Stickiness is scoped to a conversation, not the whole virtual key, so
         # an unrelated later chat on the same key does not inherit a tagged
-        # route. Prefer a client-supplied id: the fingerprint fallback shifts if
-        # history is compacted, since the first user turn can change mid-chat.
-        conversation = headers.get("x-conversation-id")
+        # route. Prefer an explicit id, then Claude Code's session id. The
+        # first-user-message fingerprint is a last resort: it shifts if
+        # history is compacted, and two sessions opening with the same text
+        # share it.
+        conversation = headers.get("x-conversation-id") or _claude_code_session_id(data)
         if not conversation:
             first_user = next(
                 (
@@ -231,8 +273,9 @@ class SkillRoutingCallback(CustomLogger):
         # `"metadata": {"trust_skill_headers": true}`) may use this path at
         # all. No key is flagged today -- this is a dormant mechanism for a
         # future non-interactive consumer, not something currently in use.
+        # Strictly the JSON boolean: a string like "false" is truthy.
         metadata = getattr(user_api_key_dict, "metadata", None) or {}
-        return bool(metadata.get("trust_skill_headers"))
+        return metadata.get("trust_skill_headers") is True
 
     def _allowed_skills(self, user_api_key_dict) -> set[str] | None:
         # Closes the gap header-trust gating didn't: the tag itself can be
@@ -246,16 +289,15 @@ class SkillRoutingCallback(CustomLogger):
         # restricted -- there is nothing to protect by blocking the cheap
         # default lane.
         metadata = getattr(user_api_key_dict, "metadata", None) or {}
-        allowed = metadata.get("allowed_skills")
-        return set(allowed) if isinstance(allowed, list) else None
-
-    def _estimate_input_tokens(self, model: str, messages: list[dict], texts: list[str]) -> int:
-        try:
-            import litellm
-
-            return litellm.token_counter(model=model, messages=messages)
-        except Exception:
-            return len("".join(texts)) // 4
+        if "allowed_skills" not in metadata:
+            return None
+        allowed = metadata["allowed_skills"]
+        if isinstance(allowed, list) and all(isinstance(skill, str) for skill in allowed):
+            return set(allowed)
+        # Present but malformed (e.g. a bare string): fail closed to
+        # untagged-only rather than silently treating the key as unrestricted.
+        _log(f"llm-trunk: malformed allowed_skills {allowed!r}; key restricted to untagged")
+        return set()
 
     async def async_pre_call_hook(
         self, user_api_key_dict, cache, data: dict, call_type: str
@@ -265,9 +307,6 @@ class SkillRoutingCallback(CustomLogger):
         # not the "metadata" key some older docs/examples reference.
         headers = data.get("litellm_metadata", {}).get("headers", {}) or {}
         session_key = self._session_key(user_api_key_dict, data, headers)
-
-        messages = _input_messages(data)
-        texts = _candidate_texts(messages)
 
         skill_id = skill_hash = None
         if self._headers_trusted(user_api_key_dict):
@@ -279,7 +318,7 @@ class SkillRoutingCallback(CustomLogger):
         # scoped to only the newest user turn (see _latest_user_text).
         if not (skill_id and skill_hash):
             skill_id = skill_hash = None
-            extracted = _extract_skill([_latest_user_text(data)], catalog)
+            extracted = _extract_skill(_latest_user_text(data), catalog)
             if extracted:
                 skill_id, skill_hash = extracted
 
@@ -292,9 +331,7 @@ class SkillRoutingCallback(CustomLogger):
             if sticky_skill_id is not None and sticky_skill_id not in allowed_skills:
                 sticky_skill_id = None
 
-        estimated_input_tokens = self._estimate_input_tokens(
-            data.get("model", ""), messages, texts
-        )
+        estimated_input_tokens = _estimate_input_tokens(data)
 
         decision = decide(catalog, skill_id, skill_hash, sticky_skill_id, estimated_input_tokens)
 
@@ -309,9 +346,20 @@ class SkillRoutingCallback(CustomLogger):
             self._touch_sticky(session_key, effective_skill_id, reinvoked=skill_id is not None)
 
         data["model"] = decision.alias
-        # LiteLLM's normalized reasoning parameter; it translates this into the
-        # upstream provider's own effort/thinking configuration.
+        # Claude Code sends its own `thinking` + `output_config.effort` (the
+        # user's /effort), and LiteLLM lets caller-supplied values win over
+        # `reasoning_effort` -- left in place, the lane's effort is silently
+        # ignored. Drop the client's; LiteLLM then maps ours per model
+        # (adaptive thinking + effort on Opus/Sonnet 5, a thinking budget on
+        # Haiku 4.5).
+        data.pop("thinking", None)
+        output_config = data.get("output_config")
+        if isinstance(output_config, dict):
+            output_config.pop("effort", None)
+            if not output_config:
+                del data["output_config"]
         data["reasoning_effort"] = decision.effort
+        data["messages"] = _fold_system_messages(data.get("messages", []))
 
         requested_max = data.get("max_tokens")
         data["max_tokens"] = (
@@ -323,6 +371,7 @@ class SkillRoutingCallback(CustomLogger):
             "skill_hash": skill_hash,
             "alias": decision.alias,
             "effort": decision.effort,
+            "estimated_input_tokens": estimated_input_tokens,
         }
         return data
 
@@ -340,6 +389,7 @@ class SkillRoutingCallback(CustomLogger):
                     "skill_hash": routing.get("skill_hash"),
                     "alias": routing.get("alias"),
                     "effort": routing.get("effort"),
+                    "estimated_input_tokens": routing.get("estimated_input_tokens"),
                     "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
                     "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
                     "cache_read_tokens": _usage_value(

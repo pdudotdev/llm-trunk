@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from policy.hash import sha256_hex, strip_frontmatter
+from policy.hash import SUBSTITUTION_RE, sha256_hex, strip_frontmatter
 
 
 def main() -> None:
@@ -24,6 +24,16 @@ def main() -> None:
     # catalog.yaml fields: routing needs both the digest and the canonical
     # byte length to isolate the body inside a larger payload.
     body = strip_frontmatter(contents)
+    substitution = SUBSTITUTION_RE.search(body)
+    if substitution:
+        print(
+            f"error: body contains {substitution.group().decode()!r}, which Claude Code "
+            "rewrites at invocation time -- the body it sends will never match this "
+            "hash, so every invocation would be denied as stale. Remove it to route "
+            "this skill.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print(f'sha256: "{sha256_hex(body)}"')
     print(f"bytes: {len(body)}")
 

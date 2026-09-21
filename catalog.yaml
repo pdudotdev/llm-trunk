@@ -3,7 +3,7 @@ untagged:
   alias: untagged
   vendor: anthropic
   effort: low
-  max_input: 16000
+  max_input: 64000
   max_output: 1500
 
 skills:
@@ -23,7 +23,7 @@ skills:
     alias: qa-test-case-execution
     vendor: anthropic
     effort: medium
-    max_input: 80000
+    max_input: 128000
     max_output: 4000
   qa-bug-logging:
     sha256: "66fb6922dcdc8842912cdd965c533afd681b926cc0f80e6ab5b3aacac620fda7"
@@ -32,7 +32,7 @@ skills:
     alias: qa-bug-logging
     vendor: anthropic
     effort: low
-    max_input: 48000
+    max_input: 96000
     max_output: 3000
   qa-fix-verification:
     sha256: "0ea6046a29b03995c27c9f3a2805f5e1929c94f9a76926c1a04a8a864c1d0315"
@@ -41,5 +41,5 @@ skills:
     alias: qa-fix-verification
     vendor: anthropic
     effort: low
-    max_input: 32000
+    max_input: 64000
     max_output: 2000
