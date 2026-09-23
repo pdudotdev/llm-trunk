@@ -47,7 +47,7 @@ COLUMNS = [
     ("MODEL · EFFORT", 18, False),
     ("LANE", 22, False),
     ("STICKY", 8, True),
-    ("INPUT est→real", 14, True),
+    ("INPUT", 9, True),
     ("COST", 7, True),
 ]
 GAP = "  "
@@ -112,6 +112,16 @@ def fmt_tokens(value: int | None) -> str:
     return f"{value / 1000:.0f}k" if value >= 10_000 else f"{value / 1000:.1f}k"
 
 
+def input_cell(tokens: int | None, cached: int | None) -> str:
+    # "(c)": most of the input was read from Anthropic's prompt cache (billed
+    # at ~10%). In practice a request is either ~0% or ~90-100% cached.
+    _, width, _ = COLUMNS[6]
+    value = fmt_tokens(tokens).rjust(width - 4)
+    if tokens and cached and cached * 2 >= tokens:
+        return value + " " + color(DIM, "(c)")
+    return value + "    "
+
+
 def fmt_left(seconds: int | None) -> str:
     if seconds is None:
         return "—"
@@ -136,7 +146,7 @@ def render_spend(clock: str, event: dict, models: dict[str, str]) -> str:
             cell(3, f"{model} · {event['effort']}" if event.get("effort") else model, MODEL_COLORS.get(model.split(" ")[0])),
             cell(4, event.get("skill_id") or "untagged"),
             cell(5, fmt_left(event.get("sticky_left_s")), DIM if kind == "untagged" else YELLOW),
-            cell(6, f"{fmt_tokens(event.get('estimated_input_tokens'))} → {fmt_tokens(event.get('input_tokens'))}"),
+            input_cell(event.get("input_tokens"), event.get("cache_read_tokens")),
             cell(7, f"${cost:.3f}" if isinstance(cost, (int, float)) else "—"),
         ]
     )
@@ -164,7 +174,7 @@ def render(message: str, clock: str, models: dict[str, str]) -> str | None:
 
 
 def header() -> str:
-    legend = "   ".join(f"{icon} {kind}" for kind, icon in ICONS.items()) + "   (i) Claude Code background call"
+    legend = "   ".join(f"{icon} {kind}" for kind, icon in ICONS.items()) + "   (i) Claude Code background call   (c) cached input"
     columns = GAP.join(
         name.rjust(width) if right else name.ljust(width) for name, width, right in COLUMNS
     )

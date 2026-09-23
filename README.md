@@ -126,14 +126,14 @@ python3 scripts/watch.py              # last 10 minutes, then live; --since 1h f
 ```
 ```
 🔀 llm-trunk · live routing   Ctrl+C to stop
-🔖 invoked   📌 sticky   ⚪ untagged   ⛔ denied   ⏳ expired   (i) Claude Code background call
+🔖 invoked   📌 sticky   ⚪ untagged   ⛔ denied   ⏳ expired   (i) Claude Code background call   (c) cached input
 
-TIME      SESSION   ROUTE            MODEL · EFFORT      LANE                      STICKY  INPUT est→real     COST
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-07:31:45  2a546ca6  ⚪ untagged      Haiku 4.5 · low     untagged                       —       48k → 41k   $0.054
-07:39:04  6073d828  🔖 invoked       Haiku 4.5 · low     qa-fix-verification     10m left       48k → 41k   $0.053
-07:39:26  6073d828  📌 sticky        Haiku 4.5 · low     qa-fix-verification     10m left       48k → 41k   $0.006
-07:39:30  6073d828  📌 sticky (i)    Haiku 4.5           qa-fix-verification     10m left     1.2k → 0.9k   $0.003
+TIME      SESSION   ROUTE            MODEL · EFFORT      LANE                      STICKY      INPUT     COST
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+07:31:45  2a546ca6  ⚪ untagged      Haiku 4.5 · low     untagged                       —    41k       $0.054
+07:39:04  6073d828  🔖 invoked       Haiku 4.5 · low     qa-fix-verification     10m left    41k       $0.053
+07:39:26  6073d828  📌 sticky        Haiku 4.5 · low     qa-fix-verification     10m left    41k (c)   $0.006
+07:39:30  6073d828  📌 sticky (i)    Haiku 4.5           qa-fix-verification     10m left   0.9k       $0.003
 07:39:50  7ee3b499  ⛔ denied        ~133338 input tokens exceeds the untagged lane cap (64000) — run /compact or start a new session
 ```
 
@@ -166,7 +166,7 @@ TIME      SESSION   ROUTE            MODEL · EFFORT      LANE                  
 
 | File | Role |
 |---|---|
-| [`scripts/watch.py`](scripts/watch.py) | Live, color-coded view of every routing decision — invoked, sticky (with time left), untagged, denied, expired, and `(i)` for Claude Code's background calls — per session, with model, effort, tokens and cost. Read-only: follows the gateway's log, so it sees all clients (CLI, IDE, Desktop, curl). Stdlib-only; `NO_COLOR=1` disables colors. |
+| [`scripts/watch.py`](scripts/watch.py) | Live, color-coded view of every routing decision — invoked, sticky (with time left), untagged, denied, expired, and `(i)` for Claude Code's background calls — per session, with model, effort, real input tokens (as billed by Anthropic, `(c)` when served from the prompt cache) and cost. Read-only: follows the gateway's log, so it sees all clients (CLI, IDE, Desktop, curl). Stdlib-only; `NO_COLOR=1` disables colors. |
 
 ## ⬆️ Planned Upgrades
 - [ ] Two LiteLLM instances sharing sticky state via Redis
