@@ -24,12 +24,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 STAMP_RE = re.compile(r"^(?P<stamp>(?P<second>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*)\s+(?P<message>.*)$")
-SPEND_RE = re.compile(r"llm-trunk spend: (\{.*\})\s*$")
-DENY_RE = re.compile(r"llm-trunk deny \[(?P<code>\w+)\](?: session=(?P<session>\S+))?: (?P<reason>.*)$")
-EXPIRED_RE = re.compile(
-    r"llm-trunk: sticky route for '(?P<skill>[^']+)' expired \((?P<why>[\w-]+)\)"
-    r"(?: session=(?P<session>\S+))?"
-)
+# The gateway writes one JSON line per outcome: "llm-trunk <kind>: {...}".
+EVENT_RE = re.compile(r"llm-trunk (?P<kind>spend|deny|expired|failed): (?P<json>\{.*\})\s*$")
 
 USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
 RED, GREEN, YELLOW, BLUE, MAGENTA, DIM, BOLD, ITALIC = "31", "32", "33", "34", "35", "2", "1", "3"
@@ -37,7 +33,10 @@ MODEL_COLORS = {"Opus": MAGENTA, "Sonnet": BLUE, "Haiku": GREEN}
 SESSION_COLORS = ["36", "33", "35", "32", "34", "96", "93", "95"]
 
 # Each icon is a single wide (2-cell) code point, so columns stay aligned.
-ICONS = {"invoked": "🔖", "sticky": "📌", "untagged": "⚪", "denied": "⛔", "expired": "⏳"}
+ICONS = {
+    "invoked": "🔖", "sticky": "📌", "untagged": "⚪",
+    "denied": "⛔", "failed": "❌", "expired": "⏳",
+}
 
 # (header, visible width, right-aligned)
 COLUMNS = [
@@ -67,7 +66,9 @@ def cell(index: int, text: str, code: str | None = None, *, wide_chars: int = 0)
 def pretty_model(model_id: str) -> str:
     # "anthropic/claude-haiku-4-5" -> "Haiku 4.5"; anything else as-is.
     name = model_id.split("/")[-1]
-    match = re.fullmatch(r"claude-([a-z]+)-(\d+(?:-\d+)?)(?:-\d{8})?", name)
+    # The minor version is 1-2 digits, so a trailing -YYYYMMDD date isn't
+    # mistaken for one ("claude-opus-4-20250514" -> "Opus 4").
+    match = re.fullmatch(r"claude-([a-z]+)-(\d+(?:-\d{1,2})?)(?:-\d{8})?", name)
     if not match:
         return name
     return f"{match.group(1).capitalize()} {match.group(2).replace('-', '.')}"
@@ -103,7 +104,8 @@ def route_cell(kind: str, code: str | None = None, *, background: bool = False) 
     if not background:
         return cell(2, label, code, wide_chars=1)
     _, width, _ = COLUMNS[2]
-    return color(code, label) + " " + color(DIM + ";" + ITALIC, "(i)") + " " * (width - len(label) - 5)
+    visible = len(label) + 1 + len(" (i)")  # the icon is 2 cells wide
+    return color(code, label) + " " + color(DIM + ";" + ITALIC, "(i)") + " " * max(0, width - visible)
 
 
 def fmt_tokens(value: int | None) -> str:
@@ -128,23 +130,31 @@ def fmt_left(seconds: int | None) -> str:
     return f"{(seconds + 59) // 60}m left" if seconds >= 60 else f"{seconds}s left"
 
 
-def render_spend(clock: str, event: dict, models: dict[str, str]) -> str:
+def route_kind(event: dict) -> str:
     if event.get("skill_id") is None:
-        kind = "untagged"
-    elif event.get("skill_hash"):
-        kind = "invoked"
-    else:
-        kind = "sticky"
+        return "untagged"
+    return "invoked" if event.get("skill_hash") else "sticky"
+
+
+def model_cells(event: dict, models: dict[str, str]) -> list[str]:
     alias = event.get("alias") or "?"
     model = models.get(alias, alias)
+    text = f"{model} · {event['effort']}" if event.get("effort") else model
+    return [
+        cell(3, text, MODEL_COLORS.get(model.split(" ")[0])),
+        cell(4, event.get("skill_id") or "untagged"),
+    ]
+
+
+def render_spend(clock: str, event: dict, models: dict[str, str]) -> str:
+    kind = route_kind(event)
     cost = event.get("cost")
     return GAP.join(
         [
             cell(0, clock, DIM),
             session_cell(event.get("session")),
             route_cell(kind, BOLD if kind == "invoked" else None, background=bool(event.get("background"))),
-            cell(3, f"{model} · {event['effort']}" if event.get("effort") else model, MODEL_COLORS.get(model.split(" ")[0])),
-            cell(4, event.get("skill_id") or "untagged"),
+            *model_cells(event, models),
             cell(5, fmt_left(event.get("sticky_left_s")), DIM if kind == "untagged" else YELLOW),
             input_cell(event.get("input_tokens"), event.get("cache_read_tokens")),
             cell(7, f"${cost:.3f}" if isinstance(cost, (int, float)) else "—"),
@@ -153,24 +163,30 @@ def render_spend(clock: str, event: dict, models: dict[str, str]) -> str:
 
 
 def render(message: str, clock: str, models: dict[str, str]) -> str | None:
-    if match := SPEND_RE.search(message):
-        try:
-            return render_spend(clock, json.loads(match.group(1)), models)
-        except ValueError:
-            return None
-    if match := DENY_RE.search(message):
-        reason = match.group("reason").removeprefix("llm-trunk: ")
+    match = EVENT_RE.search(message)
+    if not match:
+        return None
+    try:
+        event = json.loads(match.group("json"))
+    except ValueError:
+        return None
+    kind = match.group("kind")
+    background = bool(event.get("background"))
+    lead = [cell(0, clock, DIM), session_cell(event.get("session"))]
+    if kind == "spend":
+        return render_spend(clock, event, models)
+    if kind == "deny":
+        reason = str(event.get("reason", "")).removeprefix("llm-trunk: ")
+        return GAP.join([*lead, route_cell("denied", RED, background=background), color(RED, reason)])
+    if kind == "failed":
+        status = event.get("status")
+        error = f"{status}: " if status else ""
+        error += " ".join(str(event.get("error") or "upstream error").split())[:120]
         return GAP.join(
-            [cell(0, clock, DIM), session_cell(match.group("session")),
-             route_cell("denied", RED), color(RED, reason)]
+            [*lead, route_cell("failed", RED, background=background), *model_cells(event, models), color(RED, error)]
         )
-    if match := EXPIRED_RE.search(message):
-        detail = f"{match.group('skill')} ({match.group('why')}) → back to untagged"
-        return GAP.join(
-            [cell(0, clock, DIM), session_cell(match.group("session")),
-             route_cell("expired", YELLOW), color(YELLOW, detail)]
-        )
-    return None
+    detail = f"{event.get('skill_id')} ({event.get('why')}) → back to untagged"
+    return GAP.join([*lead, route_cell("expired", YELLOW), color(YELLOW, detail)])
 
 
 def header() -> str:
@@ -189,17 +205,23 @@ def header() -> str:
     )
 
 
-def follow(since: str, resume_after: str | None, models: dict[str, str]) -> str | None:
-    """Stream the log; return the stamp of the last line seen when it ends."""
+def follow(since: str, resume_after: str | None, models: dict[str, str]) -> tuple[str | None, str | None]:
+    """Stream the log; return the last stamp seen and docker's last error line."""
     command = ["docker", "compose", "logs", "-f", "-t", "--no-log-prefix", "--since", since, "litellm"]
     process = subprocess.Popen(
-        command, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1
+        command, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
     assert process.stdout is not None
+    last_error = None
     try:
         for line in process.stdout:
             match = STAMP_RE.match(line.rstrip("\n"))
-            if not match or (resume_after and match.group("stamp") <= resume_after):
+            if not match:
+                # Log lines are always timestamped (-t); anything else is
+                # docker itself talking -- e.g. an error.
+                last_error = line.strip() or last_error
+                continue
+            if resume_after and match.group("stamp") <= resume_after:
                 continue
             resume_after = match.group("stamp")
             rendered = render(match.group("message"), local_time(match.group("second")), models)
@@ -208,7 +230,7 @@ def follow(since: str, resume_after: str | None, models: dict[str, str]) -> str 
     finally:
         process.terminate()
         process.wait()
-    return resume_after
+    return resume_after, last_error
 
 
 def main() -> None:
@@ -223,10 +245,12 @@ def main() -> None:
         while True:
             # The stream ends when the gateway restarts (or isn't up yet):
             # resume after the last line shown, so nothing repeats or is lost.
-            last = follow(since, resume_after, models)
+            last, error = follow(since, resume_after, models)
             if last and last != resume_after:
                 since = resume_after = last
                 message = "gateway log ended — reconnecting"
+            elif error:
+                message = f"docker: {error}"
             else:
                 message = "waiting for the gateway (docker compose up -d)"
             if message != notice:

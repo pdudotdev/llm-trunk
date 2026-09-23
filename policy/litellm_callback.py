@@ -64,6 +64,10 @@ ARGUMENTS_MARKER = "\n\nARGUMENTS: "
 DENY_STATUS = 422
 
 
+def _header(headers: dict, name: str) -> str | None:
+    return next((value for key, value in headers.items() if key.lower() == name), None)
+
+
 def _load_catalog() -> dict:
     with open(CATALOG_PATH) as f:
         return yaml.safe_load(f)
@@ -165,6 +169,13 @@ def _latest_user_blocks(data: dict) -> list[str]:
     return []
 
 
+def _log_event(kind: str, fields: dict) -> None:
+    # One JSON line per outcome -- spend, deny, expired, failed -- which
+    # scripts/watch.py renders. Structured so a client-supplied value (e.g. a
+    # conversation id with spaces) can't break or hide a line.
+    _log(f"llm-trunk {kind}: " + json.dumps(fields))
+
+
 def _short_session(session_key: str) -> str:
     # Log label for a conversation: a prefix of its id only -- never the
     # virtual-key half of the session key.
@@ -263,20 +274,24 @@ BACKGROUND_PREFIXES = {
     "The user stepped away and is coming back.": "away_summary",
     "[SUGGESTION MODE:": "prompt_suggestion",
 }
+# Session naming: sent without tools, its only message wrapping the user's
+# text in <session> tags. Both are required -- "no tools" alone would also
+# catch a real turn from Claude Code run with tools disabled.
+TITLE_PREFIX = "<session>"
 
 
 def _background_call(data: dict, headers: dict) -> str | None:
     # Claude Code's own housekeeping requests, as opposed to the user's work.
     # They must not count as activity: an away summary would otherwise keep
     # a sticky route alive, and both would ride (and pay for) its lane.
-    # Only trusted as such for Claude Code traffic -- a curl or other
-    # client's request without tools is just a request.
-    if not any(name.lower() == "x-claude-code-session-id" for name in headers):
+    # Only considered for Claude Code traffic. The header is client-settable,
+    # so being classed as background must never grant anything: it only
+    # withholds (timer refreshes, skill invocation, thinking).
+    if _header(headers, "x-claude-code-session-id") is None:
         return None
-    # Session naming is the only Claude Code request sent without tools.
-    if not data.get("tools"):
-        return "title"
     last_text = next((block for block in reversed(_latest_user_blocks(data)) if block.strip()), "")
+    if not data.get("tools") and last_text.lstrip().startswith(TITLE_PREFIX):
+        return "title"
     for prefix, kind in BACKGROUND_PREFIXES.items():
         if last_text.lstrip().startswith(prefix):
             return kind
@@ -312,11 +327,15 @@ class SkillRoutingCallback(CustomLogger):
         )
         # Stickiness is scoped to a conversation, not the whole virtual key, so
         # an unrelated later chat on the same key does not inherit a tagged
-        # route. Prefer an explicit id, then Claude Code's session id. The
-        # first-user-message fingerprint is a last resort: it shifts if
-        # history is compacted, and two sessions opening with the same text
-        # share it.
-        conversation = headers.get("x-conversation-id") or _claude_code_session_id(data)
+        # route. Prefer an explicit id, then Claude Code's session id (from
+        # its metadata, else its header). The first-user-message fingerprint
+        # is a last resort: it shifts if history is compacted, and two
+        # sessions opening with the same text share it.
+        conversation = (
+            _header(headers, "x-conversation-id")
+            or _claude_code_session_id(data)
+            or _header(headers, "x-claude-code-session-id")
+        )
         if not conversation:
             first_user = next(
                 (
@@ -329,27 +348,28 @@ class SkillRoutingCallback(CustomLogger):
             conversation = sha256_hex(first_user.encode())
         return f"{key}:{conversation}"
 
+    @staticmethod
+    def _sticky_deadline(entry: tuple[str, float, float]) -> tuple[float, str]:
+        # When (monotonic) a route stops sticking, and which timer ends it:
+        # idle since the last real turn, or max age since the last invocation.
+        _, first_invoked_at, last_used_at = entry
+        idle = last_used_at + STICKY_IDLE_TIMEOUT_SECONDS
+        max_age = first_invoked_at + STICKY_MAX_AGE_SECONDS
+        return (idle, "idle") if idle <= max_age else (max_age, "max-age")
+
     def _get_sticky(self, session_key: str) -> str | None:
         entry = self._sticky.get(session_key)
         if entry is None:
             return None
-        skill_id, first_invoked_at, last_used_at = entry
-        now = time.monotonic()
-        if now - last_used_at > STICKY_IDLE_TIMEOUT_SECONDS:
+        deadline, why = self._sticky_deadline(entry)
+        if time.monotonic() > deadline:
             del self._sticky[session_key]
-            _log(
-                f"llm-trunk: sticky route for {skill_id!r} expired (idle) "
-                f"session={_short_session(session_key)}"
+            _log_event(
+                "expired",
+                {"skill_id": entry[0], "why": why, "session": _short_session(session_key)},
             )
             return None
-        if now - first_invoked_at > STICKY_MAX_AGE_SECONDS:
-            del self._sticky[session_key]
-            _log(
-                f"llm-trunk: sticky route for {skill_id!r} expired (max-age) "
-                f"session={_short_session(session_key)}"
-            )
-            return None
-        return skill_id
+        return entry[0]
 
     def _touch_sticky(self, session_key: str, skill_id: str, *, reinvoked: bool) -> None:
         now = time.monotonic()
@@ -360,17 +380,14 @@ class SkillRoutingCallback(CustomLogger):
         while len(self._sticky) > MAX_STICKY_SESSIONS:
             self._sticky.popitem(last=False)
 
-    def _sticky_seconds_left(self, session_key: str) -> int | None:
-        # How long the route keeps sticking if the conversation goes quiet
-        # now: whichever of the two timers runs out first.
+    def _sticky_expires_at(self, session_key: str) -> float | None:
+        # Wall-clock expiry, so the time left can be worked out when the
+        # outcome is logged -- after the reply, which can take minutes.
         entry = self._sticky.get(session_key)
         if entry is None:
             return None
-        _, first_invoked_at, last_used_at = entry
-        now = time.monotonic()
-        idle_left = STICKY_IDLE_TIMEOUT_SECONDS - (now - last_used_at)
-        age_left = STICKY_MAX_AGE_SECONDS - (now - first_invoked_at)
-        return max(0, int(min(idle_left, age_left)))
+        deadline, _ = self._sticky_deadline(entry)
+        return time.time() + (deadline - time.monotonic())
 
     def _headers_trusted(self, user_api_key_dict) -> bool:
         # x-skill-id/x-skill-hash are a self-asserted claim: the hash proves
@@ -454,9 +471,14 @@ class SkillRoutingCallback(CustomLogger):
         decision = decide(catalog, skill_id, skill_hash, sticky_skill_id, estimated_input_tokens)
 
         if decision.action == "deny":
-            _log(
-                f"llm-trunk deny [{decision.code}] session={_short_session(session_key)}: "
-                f"{decision.reason}"
+            _log_event(
+                "deny",
+                {
+                    "code": decision.code,
+                    "reason": decision.reason,
+                    "session": _short_session(session_key),
+                    "background": background,
+                },
             )
             raise HTTPException(status_code=DENY_STATUS, detail=decision.reason)
 
@@ -471,18 +493,19 @@ class SkillRoutingCallback(CustomLogger):
         # `reasoning_effort` -- left in place, the lane's effort is silently
         # ignored. Drop the client's; LiteLLM then maps ours per model
         # (adaptive thinking + effort on Opus/Sonnet 5, a thinking budget on
-        # Haiku 4.5). A title keeps its own settings: forcing the lane's
-        # effort turned thinking on for a request that asked for none. Recaps
-        # and suggestions do get the lane's effort -- Anthropic's prompt cache
-        # doesn't match across thinking settings, and with their own they
-        # re-sent the whole conversation uncached (live: 0 of 54k cached).
+        # Haiku 4.5). A title gets no thinking at all: the lane's effort
+        # turned thinking on for a request that asked for none, and keeping a
+        # client's own budget could exceed the capped max_tokens (a 400).
+        # Recaps and suggestions do get the lane's effort -- Anthropic's
+        # prompt cache doesn't match across thinking settings, and with their
+        # own they re-sent the whole conversation uncached (live: 0 of 54k).
+        data.pop("thinking", None)
+        output_config = data.get("output_config")
+        if isinstance(output_config, dict):
+            output_config.pop("effort", None)
+            if not output_config:
+                del data["output_config"]
         if background != "title":
-            data.pop("thinking", None)
-            output_config = data.get("output_config")
-            if isinstance(output_config, dict):
-                output_config.pop("effort", None)
-                if not output_config:
-                    del data["output_config"]
             data["reasoning_effort"] = decision.effort
         data["messages"] = _fold_system_messages(data.get("messages", []))
 
@@ -498,37 +521,61 @@ class SkillRoutingCallback(CustomLogger):
             "effort": None if background == "title" else decision.effort,
             "estimated_input_tokens": estimated_input_tokens,
             "session": _short_session(session_key),
-            "sticky_left_s": self._sticky_seconds_left(session_key) if effective_skill_id else None,
+            "sticky_expires_at": self._sticky_expires_at(session_key) if effective_skill_id else None,
             "background": background,
         }
         return data
 
-    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
+    @staticmethod
+    def _routing_fields(kwargs) -> dict | None:
         metadata = kwargs.get("litellm_params", {}).get("metadata", {}) or {}
-        routing = metadata.get("skill_routing", {})
+        routing = metadata.get("skill_routing")
+        if not routing:
+            return None
+        expires_at = routing.get("sticky_expires_at")
+        return {
+            "skill_id": routing.get("skill_id"),
+            "skill_hash": routing.get("skill_hash"),
+            "alias": routing.get("alias"),
+            "effort": routing.get("effort"),
+            "estimated_input_tokens": routing.get("estimated_input_tokens"),
+            "session": routing.get("session"),
+            "sticky_left_s": max(0, int(expires_at - time.time())) if expires_at else None,
+            "background": routing.get("background"),
+        }
 
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        fields = self._routing_fields(kwargs)
+        if fields is None:
+            return
         usage = getattr(response_obj, "usage", None)
+        _log_event(
+            "spend",
+            {
+                **fields,
+                "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
+                "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
+                # Reads only: a cache *write* is billed at 1.25x, the opposite
+                # of what the watcher's "(c)" tag claims.
+                "cache_read_tokens": _usage_value(usage, "cache_read_input_tokens"),
+                "cost": kwargs.get("response_cost"),
+            },
+        )
 
-        _log(
-            "llm-trunk spend: "
-            + json.dumps(
-                {
-                    "skill_id": routing.get("skill_id"),
-                    "skill_hash": routing.get("skill_hash"),
-                    "alias": routing.get("alias"),
-                    "effort": routing.get("effort"),
-                    "estimated_input_tokens": routing.get("estimated_input_tokens"),
-                    "session": routing.get("session"),
-                    "sticky_left_s": routing.get("sticky_left_s"),
-                    "background": routing.get("background"),
-                    "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
-                    "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
-                    "cache_read_tokens": _usage_value(
-                        usage, "cache_read_input_tokens", "cache_creation_input_tokens"
-                    ),
-                    "cost": kwargs.get("response_cost"),
-                }
-            )
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        # A request that was routed but failed upstream (a 400, 429, 529...).
+        # Denies never get here: they're raised before routing metadata exists.
+        fields = self._routing_fields(kwargs)
+        if fields is None:
+            return
+        error = kwargs.get("exception")
+        _log_event(
+            "failed",
+            {
+                **fields,
+                "status": getattr(error, "status_code", None),
+                "error": str(error)[:300] if error else None,
+            },
         )
 
 

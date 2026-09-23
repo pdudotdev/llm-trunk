@@ -60,8 +60,8 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] The skill's hash is checked against `catalog.yaml`
 - [x] **Allow** → model, effort and `max_tokens` are set to the lane's values, whatever the client asked for (Claude Code's own `/effort` is dropped). Mid-conversation `system` messages are moved into the user turn, since Haiku 4.5 rejects them
 - [x] **Deny** → stale hash, oversized input or a vendor price cliff; the request never reaches Anthropic
-- [x] **Claude Code's own background calls** ride the session's current lane but never start or refresh a sticky timer, so they can't keep a pricey route alive: session naming (the only request sent without tools), plus away-summary recaps and next-prompt suggestions (both recognized by the fixed instruction Claude Code appends). Recaps can also be turned off per user in Claude Code's `/config`
-- [x] After Anthropic responds, skill, lane, effort, tokens and cost are logged
+- [x] **Claude Code's own background calls** ride the session's current lane but never start or refresh a sticky timer, so they can't keep a pricey route alive: session naming (sent without tools, with Claude Code's `<session>` title prompt), plus away-summary recaps and next-prompt suggestions (both recognized by the fixed instruction Claude Code appends). Recaps can also be turned off per user in Claude Code's `/config`
+- [x] After Anthropic responds, skill, lane, effort, tokens and cost are logged — upstream failures (e.g. a 400 or 529) too
 
 > ⚠️ **NOTE:** Recap and suggestion detection matches the instruction text Claude Code appends, so a future Claude Code rewording would make them look like normal turns again — riding the lane and refreshing its timer, which is the fallback, never worse.
 
@@ -127,7 +127,7 @@ python3 scripts/watch.py              # last 10 minutes, then live; --since 1h f
 ```
 ```
 🔀 llm-trunk · live routing   Ctrl+C to stop
-🔖 invoked   📌 sticky   ⚪ untagged   ⛔ denied   ⏳ expired   (i) Claude Code background call   (c) cached input
+🔖 invoked   📌 sticky   ⚪ untagged   ⛔ denied   ❌ failed   ⏳ expired   (i) Claude Code background call   (c) cached input
 
 TIME      SESSION   ROUTE            MODEL · EFFORT      LANE                      STICKY      INPUT     COST
 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -164,11 +164,11 @@ Besides your own turns, Claude Code sends housekeeping requests of its own. llm-
 
 | Call | When it's sent | How it's recognized |
 |---|---|---|
-| **Session naming** | Once per session, after your first typed messages | The only Claude Code request sent without tools |
+| **Session naming** | Once per session, after your first typed messages | Sent without tools, with Claude Code's `<session>` title prompt |
 | **Away-summary recap** | ~3 minutes after you leave the terminal window (once you've typed at least 2 messages) | Last message starts with *"The user stepped away and is coming back."* |
 | **Next-prompt suggestion** | A few seconds after a reply | Last message starts with `[SUGGESTION MODE:` |
 
-All three ride the session's current lane (untagged if it has none) but **never start or refresh a sticky timer** — otherwise they'd keep a pricey route alive with no one working. Recaps and suggestions carry the whole conversation, so they get the lane's effort to stay cached; session naming carries none and keeps its own settings. Recaps can be turned off per user in Claude Code's `/config`.
+All three ride the session's current lane (untagged if it has none) but **never start or refresh a sticky timer** — otherwise they'd keep a pricey route alive with no one working. Recaps and suggestions carry the whole conversation, so they get the lane's effort to stay cached; session naming carries none and runs without thinking. Recaps can be turned off per user in Claude Code's `/config`.
 
 ## 📂 Project Files
 
@@ -187,7 +187,7 @@ All three ride the session's current lane (untagged if it has none) but **never 
 
 | File | Role |
 |---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The LiteLLM callback run on every request. Resolves the skill (see [How It Works](#-how-it-works)); the body is hashed over exactly the catalog's `bytes` and must end there, so any edit — appended lines included — is denied as stale until re-hashed. Applies the key's `allowed_skills` (a malformed value restricts the key to `untagged`), estimates input size, calls `decide()`, then sets model/effort/`max_tokens`. Tracks sticky routes per Claude Code `session_id` with the 10/30-minute expiry; Claude Code's background calls (session naming, recaps, next-prompt suggestions) never touch those timers. Logs each outcome — lane, session, sticky time left, estimated vs real input tokens, cost — for `scripts/watch.py`. |
+| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The LiteLLM callback run on every request. Resolves the skill (see [How It Works](#-how-it-works)); the body is hashed over exactly the catalog's `bytes` and must end there, so any edit — appended lines included — is denied as stale until re-hashed. Applies the key's `allowed_skills` (a malformed value restricts the key to `untagged`), estimates input size, calls `decide()`, then sets model/effort/`max_tokens`. Tracks sticky routes per Claude Code `session_id` with the 10/30-minute expiry; Claude Code's background calls (session naming, recaps, next-prompt suggestions) never touch those timers. Logs each outcome as one JSON line — `spend`, `deny`, `expired` or `failed`, with lane, session, sticky time left, input tokens and cost — for `scripts/watch.py`. |
 | [`policy/hash.py`](policy/hash.py) | `sha256_hex()`, used by the callback and `scripts/hash_skill.py`. `strip_frontmatter()` (BOM- and CRLF-aware, like Claude Code) and the substitution check, used by `scripts/hash_skill.py`. |
 | [`policy/cliffs.py`](policy/cliffs.py) | Vendor price-cliff thresholds (Grok/Gemini 200k, OpenAI 272k). Checked by `decide()` on every request; a no-op for Anthropic. |
 | [`policy/decide.py`](policy/decide.py) | The routing policy as a pure function: catalog + skill id/hash + sticky skill + estimated input size → allow/deny with lane, effort and reason. Checks the hash, price cliffs and `max_input` (plus unknown skill ids, reachable only via trusted headers). No LiteLLM or network dependency. |
@@ -197,7 +197,7 @@ All three ride the session's current lane (untagged if it has none) but **never 
 
 | File | Role |
 |---|---|
-| [`scripts/watch.py`](scripts/watch.py) | Live, color-coded view of every routing decision — invoked, sticky (with time left), untagged, denied, expired, and `(i)` for Claude Code's background calls — per session, with model, effort, real input tokens (as billed by Anthropic, `(c)` when served from the prompt cache) and cost. Read-only: follows the gateway's log, so it sees all clients (CLI, IDE, Desktop, curl). Stdlib-only; `NO_COLOR=1` disables colors. |
+| [`scripts/watch.py`](scripts/watch.py) | Live, color-coded view of every routing decision — invoked, sticky (with time left), untagged, denied, failed upstream, expired, and `(i)` for Claude Code's background calls — per session, with model, effort, real input tokens (as billed by Anthropic, `(c)` when served from the prompt cache) and cost. Read-only: follows the gateway's log, so it sees all clients (CLI, IDE, Desktop, curl). Stdlib-only; `NO_COLOR=1` disables colors. |
 
 ## ⬆️ Planned Upgrades
 - [ ] Two LiteLLM instances sharing sticky state via Redis
