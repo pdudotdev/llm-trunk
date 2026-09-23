@@ -165,6 +165,12 @@ def _latest_user_blocks(data: dict) -> list[str]:
     return []
 
 
+def _short_session(session_key: str) -> str:
+    # Log label for a conversation: a prefix of its id only -- never the
+    # virtual-key half of the session key.
+    return session_key.rsplit(":", 1)[-1][:8]
+
+
 def _usage_value(usage, *names):
     for name in names:
         value = getattr(usage, name, None)
@@ -247,6 +253,30 @@ def _extract_skill(
     return None
 
 
+# Claude Code's fixed instruction for its "while you were away" recap, sent
+# as the last user message ~3 minutes after the user leaves the window.
+# Matched as text, so a future Claude Code rewording would make these calls
+# look like ordinary turns again -- i.e. today's behavior, never worse.
+AWAY_SUMMARY_PREFIX = "The user stepped away and is coming back."
+
+
+def _background_call(data: dict, headers: dict) -> str | None:
+    # Claude Code's own housekeeping requests, as opposed to the user's work.
+    # They must not count as activity: an away summary would otherwise keep
+    # a sticky route alive, and both would ride (and pay for) its lane.
+    # Only trusted as such for Claude Code traffic -- a curl or other
+    # client's request without tools is just a request.
+    if not any(name.lower() == "x-claude-code-session-id" for name in headers):
+        return None
+    # Session naming is the only Claude Code request sent without tools.
+    if not data.get("tools"):
+        return "title"
+    last_text = next((block for block in reversed(_latest_user_blocks(data)) if block.strip()), "")
+    if last_text.lstrip().startswith(AWAY_SUMMARY_PREFIX):
+        return "away_summary"
+    return None
+
+
 def _claude_code_session_id(data: dict) -> str | None:
     # Claude Code sends metadata.user_id as a JSON string carrying a
     # per-session UUID: stable across compaction and distinct between
@@ -301,11 +331,17 @@ class SkillRoutingCallback(CustomLogger):
         now = time.monotonic()
         if now - last_used_at > STICKY_IDLE_TIMEOUT_SECONDS:
             del self._sticky[session_key]
-            _log(f"llm-trunk: sticky route for {skill_id!r} expired (idle)")
+            _log(
+                f"llm-trunk: sticky route for {skill_id!r} expired (idle) "
+                f"session={_short_session(session_key)}"
+            )
             return None
         if now - first_invoked_at > STICKY_MAX_AGE_SECONDS:
             del self._sticky[session_key]
-            _log(f"llm-trunk: sticky route for {skill_id!r} expired (max-age)")
+            _log(
+                f"llm-trunk: sticky route for {skill_id!r} expired (max-age) "
+                f"session={_short_session(session_key)}"
+            )
             return None
         return skill_id
 
@@ -317,6 +353,18 @@ class SkillRoutingCallback(CustomLogger):
         self._sticky.move_to_end(session_key)
         while len(self._sticky) > MAX_STICKY_SESSIONS:
             self._sticky.popitem(last=False)
+
+    def _sticky_seconds_left(self, session_key: str) -> int | None:
+        # How long the route keeps sticking if the conversation goes quiet
+        # now: whichever of the two timers runs out first.
+        entry = self._sticky.get(session_key)
+        if entry is None:
+            return None
+        _, first_invoked_at, last_used_at = entry
+        now = time.monotonic()
+        idle_left = STICKY_IDLE_TIMEOUT_SECONDS - (now - last_used_at)
+        age_left = STICKY_MAX_AGE_SECONDS - (now - first_invoked_at)
+        return max(0, int(min(idle_left, age_left)))
 
     def _headers_trusted(self, user_api_key_dict) -> bool:
         # x-skill-id/x-skill-hash are a self-asserted claim: the hash proves
@@ -363,16 +411,19 @@ class SkillRoutingCallback(CustomLogger):
         # not the "metadata" key some older docs/examples reference.
         headers = data.get("litellm_metadata", {}).get("headers", {}) or {}
         session_key = self._session_key(user_api_key_dict, data, headers)
+        background = _background_call(data, headers)
 
         skill_id = skill_hash = None
-        if self._headers_trusted(user_api_key_dict):
+        if background is None and self._headers_trusted(user_api_key_dict):
             skill_id = headers.get("x-skill-id")
             skill_hash = headers.get("x-skill-hash")
 
         # An id without a hash is an unverified client claim, so both headers
         # are required together; otherwise fall through to body extraction,
         # scoped to only the newest user turn (see _latest_user_blocks).
-        if not (skill_id and skill_hash):
+        # Background calls never invoke a skill (a title prompt quotes the
+        # user's first message, which may itself be an invocation).
+        if background is None and not (skill_id and skill_hash):
             skill_id = skill_hash = None
             extracted = _extract_skill(
                 _latest_user_blocks(data), catalog, _skill_tool_names(data)
@@ -380,6 +431,9 @@ class SkillRoutingCallback(CustomLogger):
             if extracted:
                 skill_id, skill_hash = extracted
 
+        # Background calls ride the session's current lane (untagged if it has
+        # none): an away summary carries the whole conversation, already cached
+        # on that lane's model, and moving it would re-send it uncached.
         sticky_skill_id = self._get_sticky(session_key)
 
         allowed_skills = self._allowed_skills(user_api_key_dict)
@@ -394,11 +448,15 @@ class SkillRoutingCallback(CustomLogger):
         decision = decide(catalog, skill_id, skill_hash, sticky_skill_id, estimated_input_tokens)
 
         if decision.action == "deny":
-            _log(f"llm-trunk deny [{decision.code}]: {decision.reason}")
+            _log(
+                f"llm-trunk deny [{decision.code}] session={_short_session(session_key)}: "
+                f"{decision.reason}"
+            )
             raise HTTPException(status_code=DENY_STATUS, detail=decision.reason)
 
         effective_skill_id = skill_id or sticky_skill_id
-        if effective_skill_id is not None:
+        # Only the user's own turns count as activity for the sticky timers.
+        if effective_skill_id is not None and background is None:
             self._touch_sticky(session_key, effective_skill_id, reinvoked=skill_id is not None)
 
         data["model"] = decision.alias
@@ -407,14 +465,19 @@ class SkillRoutingCallback(CustomLogger):
         # `reasoning_effort` -- left in place, the lane's effort is silently
         # ignored. Drop the client's; LiteLLM then maps ours per model
         # (adaptive thinking + effort on Opus/Sonnet 5, a thinking budget on
-        # Haiku 4.5).
-        data.pop("thinking", None)
-        output_config = data.get("output_config")
-        if isinstance(output_config, dict):
-            output_config.pop("effort", None)
-            if not output_config:
-                del data["output_config"]
-        data["reasoning_effort"] = decision.effort
+        # Haiku 4.5). A title keeps its own settings: forcing the lane's
+        # effort turned thinking on for a request that asked for none. An away
+        # summary does get the lane's effort -- Anthropic's prompt cache
+        # doesn't match across thinking settings, and with its own it re-sent
+        # the whole conversation uncached (live: 0 of 54k tokens cached).
+        if background != "title":
+            data.pop("thinking", None)
+            output_config = data.get("output_config")
+            if isinstance(output_config, dict):
+                output_config.pop("effort", None)
+                if not output_config:
+                    del data["output_config"]
+            data["reasoning_effort"] = decision.effort
         data["messages"] = _fold_system_messages(data.get("messages", []))
 
         requested_max = data.get("max_tokens")
@@ -426,8 +489,11 @@ class SkillRoutingCallback(CustomLogger):
             "skill_id": effective_skill_id,
             "skill_hash": skill_hash,
             "alias": decision.alias,
-            "effort": decision.effort,
+            "effort": None if background == "title" else decision.effort,
             "estimated_input_tokens": estimated_input_tokens,
+            "session": _short_session(session_key),
+            "sticky_left_s": self._sticky_seconds_left(session_key) if effective_skill_id else None,
+            "background": background,
         }
         return data
 
@@ -446,6 +512,9 @@ class SkillRoutingCallback(CustomLogger):
                     "alias": routing.get("alias"),
                     "effort": routing.get("effort"),
                     "estimated_input_tokens": routing.get("estimated_input_tokens"),
+                    "session": routing.get("session"),
+                    "sticky_left_s": routing.get("sticky_left_s"),
+                    "background": routing.get("background"),
                     "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
                     "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
                     "cache_read_tokens": _usage_value(

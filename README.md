@@ -59,7 +59,10 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] The skill's hash is checked against `catalog.yaml`
 - [x] **Allow** → model, effort and `max_tokens` are set to the lane's values, whatever the client asked for (Claude Code's own `/effort` is dropped). Mid-conversation `system` messages are moved into the user turn, since Haiku 4.5 rejects them
 - [x] **Deny** → stale hash, oversized input or a vendor price cliff; the request never reaches Anthropic
+- [x] **Claude Code's own background calls** ride the session's current lane but never start or refresh a sticky timer, so they can't keep a pricey route alive: session naming (the only request sent without tools) and away-summary recaps (recognized by their fixed instruction). Recaps can also be turned off per user in Claude Code's `/config`
 - [x] After Anthropic responds, skill, lane, effort, tokens and cost are logged
+
+> ⚠️ **NOTE:** Claude Code occasionally sends one more post-turn background call ~2 s after a reply, which isn't recognized yet — it rides the lane like a normal turn, extending the idle timer by those ~2 s. Recap detection matches Claude Code's instruction text, so a future rewording would make recaps look like normal turns again (today's fallback, never worse).
 
 ## 🧪 Example Session
 
@@ -117,9 +120,21 @@ Copy [`client-settings.json.example`](client-settings.json.example) to `<your-cl
 ```
 claude    # from your client repo — /your-skill-name to invoke a route
 ```
-Watch the decisions:
+Watch every routing decision live, from any client (run on the gateway host):
 ```
-docker compose logs -f litellm | grep --line-buffered "llm-trunk"
+python3 scripts/watch.py              # last 10 minutes, then live; --since 1h for more
+```
+```
+🔀 llm-trunk · live routing   Ctrl+C to stop
+🔖 invoked   📌 sticky   ⚪ untagged   ⛔ denied   ⏳ expired   (i) Claude Code background call
+
+TIME      SESSION   ROUTE            MODEL · EFFORT      LANE                      STICKY  INPUT est→real     COST
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+07:31:45  2a546ca6  ⚪ untagged      Haiku 4.5 · low     untagged                       —       48k → 41k   $0.054
+07:39:04  6073d828  🔖 invoked       Haiku 4.5 · low     qa-fix-verification     10m left       48k → 41k   $0.053
+07:39:26  6073d828  📌 sticky        Haiku 4.5 · low     qa-fix-verification     10m left       48k → 41k   $0.006
+07:39:30  6073d828  📌 sticky (i)    Haiku 4.5           qa-fix-verification     10m left     1.2k → 0.9k   $0.003
+07:39:50  7ee3b499  ⛔ denied        ~133338 input tokens exceeds the untagged lane cap (64000) — run /compact or start a new session
 ```
 
 > ⚠️ **NOTE:** `catalog.yaml` is re-read on every request, so edits apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
@@ -141,11 +156,17 @@ docker compose logs -f litellm | grep --line-buffered "llm-trunk"
 
 | File | Role |
 |---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The LiteLLM callback run on every request. Resolves the skill (see [How It Works](#-how-it-works)); the body is hashed over exactly the catalog's `bytes` and must end there, so any edit — appended lines included — is denied as stale until re-hashed. Applies the key's `allowed_skills` (a malformed value restricts the key to `untagged`), estimates input size, calls `decide()`, then sets model/effort/`max_tokens`. Tracks sticky routes per Claude Code `session_id` with the 10/30-minute expiry. Logs the outcome, including estimated vs real input tokens. |
+| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The LiteLLM callback run on every request. Resolves the skill (see [How It Works](#-how-it-works)); the body is hashed over exactly the catalog's `bytes` and must end there, so any edit — appended lines included — is denied as stale until re-hashed. Applies the key's `allowed_skills` (a malformed value restricts the key to `untagged`), estimates input size, calls `decide()`, then sets model/effort/`max_tokens`. Tracks sticky routes per Claude Code `session_id` with the 10/30-minute expiry; Claude Code's background calls (session naming, away-summary recaps) never touch those timers. Logs each outcome — lane, session, sticky time left, estimated vs real input tokens, cost — for `scripts/watch.py`. |
 | [`policy/hash.py`](policy/hash.py) | `sha256_hex()`, used by the callback and `scripts/hash_skill.py`. `strip_frontmatter()` (BOM- and CRLF-aware, like Claude Code) and the substitution check, used by `scripts/hash_skill.py`. |
 | [`policy/cliffs.py`](policy/cliffs.py) | Vendor price-cliff thresholds (Grok/Gemini 200k, OpenAI 272k). Checked by `decide()` on every request; a no-op for Anthropic. |
 | [`policy/decide.py`](policy/decide.py) | The routing policy as a pure function: catalog + skill id/hash + sticky skill + estimated input size → allow/deny with lane, effort and reason. Checks the hash, price cliffs and `max_input` (plus unknown skill ids, reachable only via trusted headers). No LiteLLM or network dependency. |
 | `policy/__init__.py` | Empty — makes `policy/` a Python package. |
+
+▫️ **Monitoring:**
+
+| File | Role |
+|---|---|
+| [`scripts/watch.py`](scripts/watch.py) | Live, color-coded view of every routing decision — invoked, sticky (with time left), untagged, denied, expired, and `(i)` for Claude Code's background calls — per session, with model, effort, tokens and cost. Read-only: follows the gateway's log, so it sees all clients (CLI, IDE, Desktop, curl). Stdlib-only; `NO_COLOR=1` disables colors. |
 
 ## ⬆️ Planned Upgrades
 - [ ] Two LiteLLM instances sharing sticky state via Redis
