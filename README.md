@@ -9,7 +9,32 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
 ▫️ **Same idea as an 802.1Q trunk port:**
 - [x] **Tagged frame** → the VLAN ID picks the VLAN. Here: the skill hash picks that skill's model/effort lane
 - [x] **Untagged frame** → goes to the native VLAN. Here: goes to `untagged` (Haiku, low effort)
-- [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml` — a slash command not in it (e.g. `/compact`, a personal skill) rides `untagged`
+- [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml` — a slash command not in it (e.g. `/compact`, a personal skill) gets no lane of its own and is treated as untagged
+
+```
+       requests        skill hashes
+    (Claude Code)     (catalog.yaml)
+__________▼_________________▼__________
+\                                     /
+ \       TAGGED    │   UNTAGGED      /
+  \  skill invoked │   no skill     /
+   \ hash verified │  this turn    /
+    \______________│______________/
+            │             │
+            │     sticky route live?
+            │        ┌────┴────┐
+            │       yes        no
+            │◄───────┘         │
+    ┌───────┼───────┐          │
+    ▼       ▼       ▼          ▼
+ skill A skill B skill C    untagged
+   Opus   Sonnet  Haiku      Haiku
+   high   medium  medium      low
+    │       │       │          │
+    └───────┴───────┼──────────┘
+                    ▼
+                Anthropic
+```
 
 ▫️ **"VLAN hopping" protection:**
 - [x] Can't fake a tag — a wrong hash for a skill is denied
@@ -31,20 +56,20 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
 
 ## 🔭 Overview
 
-A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM does the proxying; this repo owns only the **routing policy** — which model and effort level a request gets, based on which QA skill (if any) was invoked.
+A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM does the proxying; this repo owns only the **routing policy** — which model and effort level a request gets, based on which skill (if any) was invoked.
 
 ▫️ **Key characteristics:**
 - [x] **Skill-tagged routing** — the sha256 of a skill's `SKILL.md` body is the routing identity
 - [x] **Bounded stickiness** — after a skill is invoked, later messages in the same Claude Code session keep its route until it expires: 10 minutes idle, or 30 minutes since the last invocation, whichever comes first. This stops "invoke a pricey skill once, then use it for everything". It can't stop someone re-typing the skill before every question — the key's budget cap is the backstop there
 - [x] **Untagged fallback** — used when no skill is resolved: none invoked this turn and no live sticky route. Cheapest model, low effort
-- [x] **Deny rules** — a stale hash, oversized input (per-lane `max_input`, counting system prompt + messages + tool definitions), or a vendor price cliff blocks the request before it reaches Anthropic
+- [x] **Deny rules** — a stale hash, oversized input (per-lane `max_input`, estimated over system prompt + messages + tool definitions), or a vendor price cliff returns a 422 with the reason, before anything reaches Anthropic
 - [x] **Multi-vendor ready** — the price-cliff check runs on every request (a no-op for `vendor: anthropic`)
 - [x] **Local lab, not production** — one Mac, Docker Compose, no auth beyond LiteLLM's own keys
 
 ▫️ **Model tiers:**
-- [x] Opus 5 — test-plan creation
-- [x] Sonnet 5 — test execution, bug logging
-- [x] Haiku 4.5 — fix verification, untagged
+- [x] Opus 5 — test-plan creation (high effort)
+- [x] Sonnet 5 — test execution (medium), bug logging (low)
+- [x] Haiku 4.5 — fix verification, untagged (low)
 
 ## 🔀 How It Works
 
@@ -57,9 +82,9 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 ▫️ **Every request:**
 - [x] Claude Code sends the request to the proxy
 - [x] The callback resolves the skill, in order: trusted headers → a skill invoked in the **newest user turn** (a typed `/skill`, or Claude calling its `Skill` tool) → sticky route → `untagged`. Older turns are ignored, since Claude Code resends the whole conversation every turn
-- [x] The skill's hash is checked against `catalog.yaml`
-- [x] **Allow** → model, effort and `max_tokens` are set to the lane's values, whatever the client asked for (Claude Code's own `/effort` is dropped). Mid-conversation `system` messages are moved into the user turn, since Haiku 4.5 rejects them
-- [x] **Deny** → stale hash, oversized input or a vendor price cliff; the request never reaches Anthropic
+- [x] The skill's hash is checked against `catalog.yaml`, and the skill against the key's `allowed_skills` (if set)
+- [x] **Allow** → model and effort are set to the lane's, whatever the client asked for (Claude Code's own `/effort` is dropped), and `max_tokens` is capped at the lane's `max_output`. Mid-conversation `system` messages are moved into the user turn, since Haiku 4.5 rejects them
+- [x] **Deny** → stale hash, oversized input or a vendor price cliff: a 422 with the reason; the request never reaches Anthropic
 - [x] **Claude Code's own background calls** ride the session's current lane but never start or refresh a sticky timer, so they can't keep a pricey route alive: session naming (sent without tools, with Claude Code's `<session>` title prompt), plus away-summary recaps and next-prompt suggestions (both recognized by the fixed instruction Claude Code appends). Recaps can also be turned off per user in Claude Code's `/config`
 - [x] After Anthropic responds, skill, lane, effort, tokens and cost are logged — upstream failures (e.g. a 400 or 529) too
 
@@ -82,7 +107,9 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 | 9 | Appends a line to a skill, then runs it | **422** stale hash — never reaches Anthropic |
 | 10 | Pastes a ~200 KB log into an untagged session | **422** input cap (~89k estimated ≥ 64k) — never reaches Anthropic |
 
-> ⚠️ **NOTE:** Switching lanes costs one uncached turn (~$0.13 vs ~$0.03 for a cached Sonnet/Opus turn here) — Anthropic's prompt cache doesn't carry across a model or effort change. Every deny is a 422 whose message Claude Code shows as-is, e.g. `API Error: 422 llm-trunk: ~89409 input tokens exceeds the untagged lane cap (64000) — run /compact or start a new session`.
+> ⚠️ **NOTE:** Switching to a lane with a different model or effort costs one uncached turn (~$0.13 on Sonnet, vs ~$0.01 cached) — Anthropic's prompt cache is per model and settings (see [Concepts 101](#-concepts-101)).
+
+> ⚠️ **NOTE:** Claude Code shows a deny's message as-is, e.g. `API Error: 422 llm-trunk: ~89409 input tokens exceeds the untagged lane cap (64000) — run /compact or start a new session`.
 
 ## 🚀 Installation & Usage
 
@@ -97,7 +124,7 @@ git clone https://github.com/pdudotdev/llm-trunk
 cd llm-trunk
 cp .env.example .env
 ```
-Fill in `.env`: `LITELLM_MASTER_KEY` (any strong string), `ANTHROPIC_API_KEY` (the **routed-client** workspace key), and `POSTGRES_PASSWORD` (`openssl rand -hex 24` — must be URL-safe, see `.env.example`).
+Fill in `.env`: `LITELLM_MASTER_KEY` (any strong string), `ANTHROPIC_API_KEY` (the key the gateway calls Anthropic with — a dedicated workspace makes its spend easy to track), and `POSTGRES_PASSWORD` (`openssl rand -hex 24` — must be URL-safe, see `.env.example`).
 
 ▫️ **Step 2 - Start the stack:**
 ```
@@ -109,7 +136,7 @@ docker compose logs -f litellm    # confirm a clean boot
 ```
 python3 scripts/hash_skill.py path/to/SKILL.md
 ```
-Paste the printed `sha256`/`bytes` into `catalog.yaml` for each skill.
+Paste the printed `sha256`/`bytes` into that skill's row in `catalog.yaml`. For a **new** skill, add a full row (alias, vendor, effort, caps) and a matching `model_name` entry in `litellm/config.yaml`.
 
 ▫️ **Step 4 - Mint a virtual key:**
 ```
@@ -156,7 +183,7 @@ Each turn reads everything earlier from cache and pays full price only for the s
 
 - **Price:** a cache read costs **0.1×** the normal input price; the first write costs **1.25×**
 - **Expiry:** ~5 minutes without use (each hit resets it) — separate from llm-trunk's 10-minute sticky timer
-- **What breaks it** (the next turn pays full price once): a change to anything *earlier* in the request (e.g. `/compact` rewriting history), a different model (each lane's model has its own cache — switching lanes costs one uncached turn), or different thinking/effort settings
+- **What breaks it** (the next turn pays full price once): a change to anything *earlier* in the request (e.g. `/compact` rewriting history), a different model (each model has its own cache), or different thinking/effort settings — so switching to a lane with another model or effort costs one uncached turn, while lanes sharing both share the cache
 
 ▫️ **Claude Code background calls — the `(i)` tag in the watcher**
 
