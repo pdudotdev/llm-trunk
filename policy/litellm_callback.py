@@ -253,11 +253,16 @@ def _extract_skill(
     return None
 
 
-# Claude Code's fixed instruction for its "while you were away" recap, sent
-# as the last user message ~3 minutes after the user leaves the window.
-# Matched as text, so a future Claude Code rewording would make these calls
-# look like ordinary turns again -- i.e. today's behavior, never worse.
-AWAY_SUMMARY_PREFIX = "The user stepped away and is coming back."
+# Fixed instructions Claude Code appends as the last user message of its own
+# housekeeping requests (checked on the wire): the "while you were away"
+# recap, ~3 minutes after the user leaves the window, and the next-prompt
+# suggestion, right after a reply. Matched as text, so a future Claude Code
+# rewording makes these look like ordinary turns again -- today's fallback,
+# never worse.
+BACKGROUND_PREFIXES = {
+    "The user stepped away and is coming back.": "away_summary",
+    "[SUGGESTION MODE:": "prompt_suggestion",
+}
 
 
 def _background_call(data: dict, headers: dict) -> str | None:
@@ -272,8 +277,9 @@ def _background_call(data: dict, headers: dict) -> str | None:
     if not data.get("tools"):
         return "title"
     last_text = next((block for block in reversed(_latest_user_blocks(data)) if block.strip()), "")
-    if last_text.lstrip().startswith(AWAY_SUMMARY_PREFIX):
-        return "away_summary"
+    for prefix, kind in BACKGROUND_PREFIXES.items():
+        if last_text.lstrip().startswith(prefix):
+            return kind
     return None
 
 
@@ -432,8 +438,8 @@ class SkillRoutingCallback(CustomLogger):
                 skill_id, skill_hash = extracted
 
         # Background calls ride the session's current lane (untagged if it has
-        # none): an away summary carries the whole conversation, already cached
-        # on that lane's model, and moving it would re-send it uncached.
+        # none): recaps and suggestions carry the whole conversation, already
+        # cached on that lane's model, and moving them would re-send it uncached.
         sticky_skill_id = self._get_sticky(session_key)
 
         allowed_skills = self._allowed_skills(user_api_key_dict)
@@ -466,10 +472,10 @@ class SkillRoutingCallback(CustomLogger):
         # ignored. Drop the client's; LiteLLM then maps ours per model
         # (adaptive thinking + effort on Opus/Sonnet 5, a thinking budget on
         # Haiku 4.5). A title keeps its own settings: forcing the lane's
-        # effort turned thinking on for a request that asked for none. An away
-        # summary does get the lane's effort -- Anthropic's prompt cache
-        # doesn't match across thinking settings, and with its own it re-sent
-        # the whole conversation uncached (live: 0 of 54k tokens cached).
+        # effort turned thinking on for a request that asked for none. Recaps
+        # and suggestions do get the lane's effort -- Anthropic's prompt cache
+        # doesn't match across thinking settings, and with their own they
+        # re-sent the whole conversation uncached (live: 0 of 54k cached).
         if background != "title":
             data.pop("thinking", None)
             output_config = data.get("output_config")
