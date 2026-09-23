@@ -22,6 +22,7 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
   - [🔀 How It Works](#-how-it-works)
   - [🧪 Example Session](#-example-session)
   - [🚀 Installation & Usage](#-installation--usage)
+  - [💡 Concepts 101](#-concepts-101)
   - [📂 Project Files](#-project-files)
   - [⬆️ Planned Upgrades](#️-planned-upgrades)
   - [📄 Disclaimer](#-disclaimer)
@@ -138,6 +139,36 @@ TIME      SESSION   ROUTE            MODEL · EFFORT      LANE                  
 ```
 
 > ⚠️ **NOTE:** `catalog.yaml` is re-read on every request, so edits apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
+
+## 💡 Concepts 101
+
+▫️ **Prompt caching — the `(c)` tag in the watcher**
+
+Anthropic caches the start of each request: Claude Code marks the tool definitions, system prompt and conversation so far as cacheable. The cache doesn't need the whole request to match — it matches the **longest identical beginning**. A conversation only ever grows **at the end**, so every request starts with exactly what the previous one sent:
+
+| Request | Contents | From cache | Processed fresh |
+|---|---|---|---|
+| Turn 1 | tools + system + **msg 1** | nothing (first time) | everything — and it's stored |
+| Turn 2 | tools + system + msg 1 + reply 1 + **msg 2** | everything up to msg 1 | reply 1 + msg 2 — stored too |
+| Turn 3 | … + msg 2 + reply 2 + **msg 3** | everything up to msg 2 | reply 2 + msg 3 |
+
+Each turn reads everything earlier from cache and pays full price only for the small new tail — which gets stored for the next turn. In a real session, a `what severity?` turn had 55,427 input tokens, of which 55,173 came from cache: only 254 were new, so it cost $0.012 instead of ~$0.14.
+
+- **Price:** a cache read costs **0.1×** the normal input price; the first write costs **1.25×**
+- **Expiry:** ~5 minutes without use (each hit resets it) — separate from llm-trunk's 10-minute sticky timer
+- **What breaks it** (the next turn pays full price once): a change to anything *earlier* in the request (e.g. `/compact` rewriting history), a different model (each lane's model has its own cache — switching lanes costs one uncached turn), or different thinking/effort settings
+
+▫️ **Claude Code background calls — the `(i)` tag in the watcher**
+
+Besides your own turns, Claude Code sends housekeeping requests of its own. llm-trunk recognizes three, identified during live testing:
+
+| Call | When it's sent | How it's recognized |
+|---|---|---|
+| **Session naming** | Once per session, after your first typed messages | The only Claude Code request sent without tools |
+| **Away-summary recap** | ~3 minutes after you leave the terminal window (once you've typed at least 2 messages) | Last message starts with *"The user stepped away and is coming back."* |
+| **Next-prompt suggestion** | A few seconds after a reply | Last message starts with `[SUGGESTION MODE:` |
+
+All three ride the session's current lane (untagged if it has none) but **never start or refresh a sticky timer** — otherwise they'd keep a pricey route alive with no one working. Recaps and suggestions carry the whole conversation, so they get the lane's effort to stay cached; session naming carries none and keeps its own settings. Recaps can be turned off per user in Claude Code's `/config`.
 
 ## 📂 Project Files
 
