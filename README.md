@@ -15,7 +15,7 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
        skills        other requests
    (catalog.yaml)        (chat)
 __________▼_________________▼__________
-\                  |                  /
+\                  │                  /
  \       TAGGED    │   UNTAGGED      /
   \  skill invoked │   no skill     /
    \ hash verified │  this turn    /
