@@ -12,8 +12,8 @@ Skill-tagged routing gateway built on [LiteLLM](https://docs.litellm.ai/). Route
 - [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml` — a slash command not in it (e.g. `/compact`, a personal skill) gets no lane of its own and is treated as untagged
 
 ```
-       requests        skill hashes
-    (Claude Code)     (catalog.yaml)
+       skills        other requests
+   (catalog.yaml)        (chat)
 __________▼_________________▼__________
 \                                     /
  \       TAGGED    │   UNTAGGED      /
@@ -21,7 +21,7 @@ __________▼_________________▼__________
    \ hash verified │  this turn    /
     \______________│______________/
             │             │
-            │     sticky route live?
+            │   sticky (session cont.)
             │        ┌────┴────┐
             │       yes        no
             │◄───────┘         │
