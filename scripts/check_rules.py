@@ -18,7 +18,8 @@ The rules (see ROADMAP.md, "Design: tier-based routing"):
   compaction             -> the session's tier
   suggestion / recap     -> the session's tier
   session title          -> the lowest tier
-  permission check       -> passed through: the model Claude Code asked for
+  permission check       -> the tier running the model Claude Code asked for
+                            (the most capable tier if none does); effort as sent
 and the model that answered must be the one configured for the tier.
 """
 import argparse
@@ -46,13 +47,17 @@ def load_config() -> tuple[dict, dict[str, str]]:
     return catalog, tier_models
 
 
-def expected_tier(event: dict, catalog: dict, agents: dict) -> tuple[str | None, str]:
+def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[str, str]) -> tuple[str | None, str]:
     """(tier this request should have gone to, the rule that says so)."""
     kind = event.get("request_type")
     session_tier = event.get("session_tier") or lowest(catalog)
     background = event.get("background")
     if background == "permission_check":
-        return None, "permission check passes through"
+        wanted = model_key(event.get("requested_model"))
+        for tier in reversed(catalog["order"]):
+            if model_key(tier_models.get(tier)) == wanted:
+                return tier, "permission check -> tier running the model asked for"
+        return catalog["order"][-1], "permission check -> most capable tier"
     if background == "title":
         return lowest(catalog), "session title -> lowest tier"
     if kind == "skill" and event.get("unregistered_skill"):
@@ -82,19 +87,14 @@ def check(events: list[tuple[datetime, str, dict]], catalog: dict, tier_models: 
             skipped += 1
             continue
         checked += 1
-        expected, rule = expected_tier(event, catalog, agents)
+        expected, rule = expected_tier(event, catalog, agents, tier_models)
         actual = event.get("tier")
         problems = []
-        if event.get("background") == "permission_check":
-            served, asked = model_key(event.get("model")), model_key(event.get("requested_model"))
-            if actual is not None or (served and asked and served != asked):
-                problems.append(f"expected passthrough to {asked}, got tier {actual} / model {served}")
-        else:
-            if actual != expected:
-                problems.append(f"expected tier {expected}, got {actual}")
-            served, configured = model_key(event.get("model")), model_key(tier_models.get(actual or ""))
-            if served and configured and served != configured:
-                problems.append(f"tier {actual} should run {configured}, but {served} answered")
+        if actual != expected:
+            problems.append(f"expected tier {expected}, got {actual}")
+        served, configured = model_key(event.get("model")), model_key(tier_models.get(actual or ""))
+        if served and configured and served != configured:
+            problems.append(f"tier {actual} should run {configured}, but {served} answered")
         if event.get("request_type") == "subagent" and actual:
             agents.setdefault((event.get("session"), event.get("agent")), actual)
         for problem in problems:

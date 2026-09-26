@@ -21,6 +21,7 @@ def _log(message: str) -> None:
 
 
 CATALOG_PATH = "/app/catalog.yaml"
+CONFIG_PATH = "/app/config.yaml"
 MAX_STICKY_SESSIONS = 1024
 
 # Input-size estimate: a plain character count over everything the model is
@@ -71,6 +72,30 @@ def _header(headers: dict, name: str) -> str | None:
 def _load_catalog() -> dict:
     with open(CATALOG_PATH) as f:
         return yaml.safe_load(f)
+
+
+def _model_family(model: str | None) -> str:
+    """claude-opus-5-5-20260915 / anthropic/claude-opus-5-5[1m] -> claude-opus-5-5."""
+    name = (model or "").lower().split("/")[-1].replace("[1m]", "")
+    return re.sub(r"-\d{8}$", "", name)
+
+
+def _tier_models() -> dict[str, str]:
+    """Tier -> the model family it runs, from LiteLLM's own config."""
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    return {entry["model_name"]: _model_family(entry["litellm_params"]["model"]) for entry in config["model_list"]}
+
+
+def passthrough_tier(catalog: dict, tier_models: dict[str, str], requested_model: str | None) -> str:
+    """The tier that runs the model the client asked for. LiteLLM only serves
+    the tiers it's configured with, so a request can't keep a raw model name;
+    when no tier runs that model, the most capable tier -- never a weaker one."""
+    wanted = _model_family(requested_model)
+    for tier in reversed(catalog["order"]):
+        if tier_models.get(tier) == wanted:
+            return tier
+    return catalog["order"][-1]
 
 
 def _message_text(content: Any) -> str:
@@ -543,9 +568,13 @@ class SkillRoutingCallback(CustomLogger):
         }
 
         if background == "permission_check":
-            # Passed through as sent: model, effort and limits are Claude Code's.
+            # Claude Code picks this model on purpose; a weaker one would weaken
+            # the safety check. It goes to the tier running that model, with
+            # effort and limits exactly as Claude Code sent them.
+            tier = passthrough_tier(catalog, _tier_models(), requested_model)
+            data["model"] = tier
             data.setdefault("litellm_metadata", {})["skill_routing"] = {
-                **routing, "skill_id": None, "alias": requested_model, "tier": None, "effort": None, "sticky_expires_at": None,
+                **routing, "skill_id": None, "alias": tier, "tier": tier, "effort": None, "sticky_expires_at": None,
             }
             return data
 

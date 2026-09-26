@@ -87,6 +87,7 @@ def catalog(tmp_path, monkeypatch) -> dict:
     path = tmp_path / "catalog.yaml"
     path.write_text(yaml.safe_dump(data))
     monkeypatch.setattr(cb, "CATALOG_PATH", str(path))
+    monkeypatch.setattr(cb, "CONFIG_PATH", str(REPO / "litellm" / "config.yaml"))
     return data
 
 
@@ -203,9 +204,9 @@ def compaction_request(*history: dict, session: str = "session-1", **extra) -> d
     return request(*history[:-1], last, session=session, **extra)
 
 
-def permission_check_request(session: str = "session-1") -> dict:
+def permission_check_request(session: str = "session-1", model: str = "claude-sonnet-5") -> dict:
     data = request(user("<transcript>\n{\"user\":\"list the folders\"}\n</transcript>"), session=session, tools=False)
-    data["model"] = "claude-sonnet-5"
+    data["model"] = model
     data["max_tokens"] = 64
     data["system"] = [{"type": "text", "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"}]
     return data

@@ -74,7 +74,7 @@ def test_spend_event_is_rendered(gateway, capsys):
         (lambda: subagent_request(), "subagent", "moderate"),
         (lambda: compaction_request(skill_turn("plan"), assistant(), user("go")), "compaction", "complex · plan"),
         (lambda: request(skill_turn("plan"), assistant(), unregistered_turn()), "unregistered", "light · personal-notes"),
-        (lambda: permission_check_request(), "passthrough", "passed through"),
+        (lambda: permission_check_request(), "passthrough", "moderate · permission"),
     ],
 )
 def test_every_request_type_is_rendered(gateway, capsys, build, route, lane):

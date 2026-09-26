@@ -1,6 +1,7 @@
 """The LiteLLM callback: classifying requests, stickiness, background calls,
 access control and how the outgoing request is rewritten."""
 import pytest
+import yaml
 from conftest import (
     BODIES,
     HTTPException,
@@ -16,6 +17,10 @@ from conftest import (
     unregistered_turn,
     user,
 )
+from conftest import REPO
+
+# The model names LiteLLM serves: one per tier.
+SERVED = {entry["model_name"] for entry in yaml.safe_load((REPO / "litellm" / "config.yaml").read_text())["model_list"]}
 
 # --- Skill detection -----------------------------------------------------------
 
@@ -234,13 +239,30 @@ def test_background_detection_needs_the_claude_code_header(gateway, clock):
     assert _follow_up(gateway)["model"] == "complex"
 
 
-def test_permission_check_passes_through_untouched(gateway):
+@pytest.mark.parametrize(
+    ("asked", "tier"),
+    [
+        ("claude-sonnet-5", "moderate"),
+        ("claude-opus-5-5", "complex"),
+        ("claude-opus-5-5-20260915", "complex"),
+        ("claude-haiku-4-5-20251001", "light"),
+        ("claude-sonnet-4-6", "complex"),  # no tier runs it: the most capable, never weaker
+    ],
+)
+def test_permission_check_keeps_the_model_claude_code_chose(gateway, asked, tier):
     _invoke_plan(gateway)
-    sent = permission_check_request()
-    data = gateway.send(sent)
-    assert data["model"] == "claude-sonnet-5"  # the model Claude Code chose for its safety check
-    assert data["max_tokens"] == 64 and "reasoning_effort" not in data
-    assert (routing(data)["background"], routing(data)["tier"]) == ("permission_check", None)
+    data = gateway.send(permission_check_request(model=asked))
+    assert data["model"] == tier
+    assert data["max_tokens"] == 64 and "reasoning_effort" not in data  # limits and effort as sent
+    assert (routing(data)["background"], routing(data)["tier"]) == ("permission_check", tier)
+
+
+def test_permission_check_does_not_touch_the_route(gateway, clock):
+    _invoke_plan(gateway)
+    clock.advance(500)
+    gateway.send(permission_check_request())
+    clock.advance(200)
+    assert _follow_up(gateway)["model"] == "light"
 
 
 # --- Access control ----------------------------------------------------------------
@@ -371,3 +393,24 @@ def test_every_request_carries_type_and_tier(gateway):
         assert fields["request_type"] in ("normal", "subagent", "compaction", "background")
         assert fields["tier"] in ("light", "moderate", "complex")
         assert fields["session_tier"] == "complex"
+
+
+
+
+@pytest.mark.parametrize("asked", ["claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6", "some-future-model"])
+def test_outgoing_model_is_always_one_litellm_serves(gateway, asked):
+    # LiteLLM only serves its configured model names: anything else fails
+    # before it reaches Anthropic (live: auto mode's permission checks did).
+    gateway.send(request(skill_turn("plan")))
+    builders = [
+        lambda: request(user("hi"), model=asked),
+        lambda: request(skill_turn("plan"), assistant(), skill_turn("review"), model=asked),
+        lambda: request(unregistered_turn(), model=asked),
+        lambda: subagent_request(),
+        lambda: compaction_request(skill_turn("plan"), assistant(), user("go"), model=asked),
+        lambda: request(user("<session>t</session>"), tools=False, model=asked),
+        lambda: request(skill_turn("plan"), assistant(), user("[SUGGESTION MODE: x]"), model=asked),
+        lambda: permission_check_request(model=asked),
+    ]
+    for build in builders:
+        assert gateway.send(build())["model"] in SERVED

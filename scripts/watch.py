@@ -169,9 +169,9 @@ def request_type_of(event: dict) -> str:
 
 def lane_text(event: dict) -> str:
     """Where the request went: the tier, plus the skill that put it there."""
-    if event.get("background") == "permission_check":
-        return "passed through"
     tier = event.get("tier")
+    if event.get("background") == "permission_check":
+        return f"{tier} · permission" if tier else "passed through"
     skill = event.get("unregistered_skill") or event.get("skill_id")
     if not tier:
         # Old events (per-skill lanes), or a passed-through request.

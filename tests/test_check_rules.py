@@ -79,7 +79,8 @@ def _event(**fields):
         ({"request_type": "compaction", "session_tier": "complex", "tier": "light"}, "expected tier complex"),
         ({"request_type": "background", "background": "title", "session_tier": "complex", "tier": "complex", "model": "claude-opus-5-5"}, "expected tier light"),
         ({"request_type": "background", "background": "prompt_suggestion", "session_tier": "moderate", "tier": "light"}, "expected tier moderate"),
-        ({"background": "permission_check", "request_type": "background", "tier": None, "requested_model": "claude-sonnet-5", "model": "claude-haiku-4-5"}, "expected passthrough"),
+        ({"background": "permission_check", "request_type": "background", "tier": "light", "requested_model": "claude-sonnet-5"}, "expected tier moderate, got light"),
+        ({"background": "permission_check", "request_type": "background", "tier": "moderate", "requested_model": "claude-sonnet-4-6", "model": "claude-sonnet-5"}, "expected tier complex"),
         ({"model": "claude-sonnet-5"}, "tier light should run claude-haiku-4-5, but claude-sonnet-5 answered"),
     ],
 )
