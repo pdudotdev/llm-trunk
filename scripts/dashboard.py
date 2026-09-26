@@ -3,8 +3,8 @@
 
 Run on the machine hosting the gateway, from anywhere in the repo:
 
-    python3 scripts/dashboard.py              # last hour of history, then live
-    python3 scripts/dashboard.py --since 24h
+    python3 scripts/dashboard.py              # starts empty: only traffic from now on
+    python3 scripts/dashboard.py --since 24h  # include the last 24 hours of history
     python3 scripts/dashboard.py --ttl 60m    # prompt-cache lifetime (default 5m)
     python3 scripts/dashboard.py --window 2h  # sessions shown if active this recently (default 30m)
 
@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -347,7 +347,7 @@ def duration(text: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live cost dashboard for llm-trunk.")
-    parser.add_argument("--since", default="1h", help="history to load first (default: 1h)")
+    parser.add_argument("--since", help="history to load first, e.g. 1h (default: none, start fresh)")
     parser.add_argument("--ttl", default="5m", choices=["5m", "60m"], help="prompt-cache lifetime (default: 5m)")
     parser.add_argument("--window", default="30m", type=duration, help="show sessions active this recently, e.g. 30m or 2h (default: 30m)")
     args = parser.parse_args()
@@ -355,7 +355,9 @@ def main() -> None:
     dash = Dashboard(load_prices(), load_routes(), 300 if args.ttl == "5m" else 3600, window_seconds=args.window)
     events: queue.Queue = queue.Queue()
     stop = threading.Event()
-    threading.Thread(target=stream, args=(args.since, events, stop), daemon=True).start()
+    # Without --since, start fresh: earlier sessions would only confuse a new run.
+    since = args.since or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    threading.Thread(target=stream, args=(since, events, stop), daemon=True).start()
     try:
         with Live(render(dash), screen=True, auto_refresh=False, console=Console()) as live:
             while True:

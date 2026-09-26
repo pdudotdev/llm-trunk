@@ -192,7 +192,7 @@ Run these in the `llm-trunk` folder on the gateway's machine.
 
 | Command | What it does |
 |---|---|
-| `python3 scripts/dashboard.py` | Live dashboard: savings, spend per request type, prompt-cache countdown per session, live feed |
+| `python3 scripts/dashboard.py` | Live dashboard: savings, spend per request type, prompt-cache countdown per session, live feed. Starts empty; `--since 1h` adds history |
 | `python3 scripts/watch.py` | Live log, one line per request |
 | `python3 scripts/report.py --since 24h` | Cost totals per request type, tier, day and session |
 | `python3 scripts/check_rules.py --since 1h` | Checks every logged request against the routing rules; exits with 1 on a violation |
