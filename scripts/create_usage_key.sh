@@ -24,7 +24,9 @@ set +a
 # it without one), and model_rpm_limit/model_tpm_limit are silently
 # swallowed into inert metadata by this LiteLLM version instead of being
 # enforced (confirmed via /key/info -- no error, but no effect either).
-curl -s -X POST "http://127.0.0.1:4000/key/generate" \
+# --fail-with-body: an HTTP error (bad master key, DB down) exits non-zero
+# and still prints the reason; -S reports a gateway that isn't running.
+curl -sS --fail-with-body -X POST "http://127.0.0.1:4000/key/generate" \
   -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
   -H "Content-Type: application/json" \
   -d '{

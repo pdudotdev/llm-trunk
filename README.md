@@ -77,7 +77,7 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 
 ▫️ **Key characteristics:**
 - [x] **Bounded stickiness** — after a registered skill runs, later messages in the same Claude Code session keep its tier until it expires: 10 minutes idle, or 30 minutes since the last invocation, whichever comes first. Background calls (permission checks included), subagents and compaction never refresh it; an unregistered skill ends it
-- [x] **Deny rules** — a stale hash or oversized input (per-tier `max_input`, estimated over system prompt + messages + tool definitions; compaction is exempt) returns a 422 with the reason, before anything reaches Anthropic
+- [x] **Deny rules** — a stale hash or oversized input (per-tier `max_input`, estimated over system prompt + messages + tool definitions; compaction is exempt) returns a 400 (`invalid_request_error`) with the reason, before anything reaches Anthropic
 - [x] **Measured** — every routed request logs its type, tier, tokens (cache reads and writes), cost, the model that answered and the model Claude Code asked for
 - [x] **Local lab, not production** — one Mac, Docker Compose, no auth beyond LiteLLM's own keys
 
@@ -97,7 +97,7 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] **skill** — a skill invoked in the **newest user turn** (a typed `/skill`, or Claude calling its `Skill` tool); older turns are ignored, since Claude Code resends the whole conversation. Registered = in the catalog, hash matching, allowed for the key. Built-in commands like `/model` carry no skill body and don't count
 - [x] **normal** — everything else
 - [x] **Allow** → model and effort are set to the tier's, whatever the client asked for (Claude Code's own `/effort` is dropped; titles run without thinking, permission checks keep Claude Code's effort), and `max_tokens` is capped at the tier's `max_output`. Mid-conversation `system` messages are moved into the user turn, since Haiku 4.5 rejects them
-- [x] **Deny** → stale hash or oversized input: a 422 with the reason; the request never reaches Anthropic
+- [x] **Deny** → stale hash or oversized input: a 400 with the reason; the request never reaches Anthropic
 - [x] After Anthropic responds, one JSON line is logged: request type, tier, session tier, skill, tokens (including cache reads and writes), cost, the model that answered and the one asked for — upstream failures (e.g. a 400 or 529) too
 
 > ⚠️ **NOTE:** Background, compaction and permission-check detection matches text Claude Code sends, so a future rewording would make those requests look like normal turns: routed to the session's tier and refreshing its timer. An undetected compaction would also be subject to the input cap again, and an undetected permission check would run on the session's tier. Neither `tests/` (which use fixed copies of these texts) nor `scripts/check_rules.py` (which judges the logged request type) would notice; after a Claude Code upgrade, check `scripts/watch.py` for the 🔒/compaction/background labels.
@@ -115,13 +115,13 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 | 5 | Asks Claude to use a subagent | subagent → `light`, one tier below `moderate` |
 | 6 | Runs `/personal-notes` (not in the catalog) | unregistered → `light`, and the follow-up stays there |
 | 7 | Runs `/compact` in a `complex` session that's over the cap | compaction → stays on `complex`, not capped |
-| 8 | Edits or appends to a skill, then runs it | **422** stale hash — never reaches Anthropic |
-| 9 | Pastes a ~200 KB log into a `light` session | **422** input cap (≥ 64k) — never reaches Anthropic |
+| 8 | Edits or appends to a skill, then runs it | **400** stale hash — never reaches Anthropic |
+| 9 | Pastes a ~200 KB log into a `light` session | **400** input cap (≥ 64k) — never reaches Anthropic |
 | 10 | Starts a new session | nothing carried over from the old one |
 
 > ⚠️ **NOTE:** Switching to a tier with a different model or effort costs one uncached turn — Anthropic's prompt cache is per model and settings (see [Concepts 101](#-concepts-101)). Subagents are the cheapest place to downgrade: they start a fresh context anyway.
 
-> ⚠️ **NOTE:** Claude Code shows a deny's message as-is, e.g. `API Error: 422 llm-trunk: ~89409 input tokens exceeds the light tier cap (64000) — run /compact or start a new session`.
+> ⚠️ **NOTE:** Claude Code shows a deny's message as-is, e.g. `API Error: 400 llm-trunk: ~89409 input tokens exceeds the light tier cap (64000) — run /compact or start a new session`.
 
 ## 🚀 Installation & Usage
 

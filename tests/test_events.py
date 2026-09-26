@@ -77,6 +77,7 @@ def test_spend_event_is_rendered(gateway, capsys):
         (lambda: compaction_request(skill_turn("plan"), assistant(), user("go")), "compaction", "complex · plan"),
         (lambda: request(skill_turn("plan"), assistant(), unregistered_turn()), "unregistered", "light · personal-notes"),
         (lambda: permission_check_request(), "permission", "moderate · permission"),
+        (lambda: request(user("<session>fix login</session>"), tools=False), "title", "light"),
     ],
 )
 def test_every_request_type_is_rendered(gateway, capsys, build, route, where):

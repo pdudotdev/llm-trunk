@@ -61,10 +61,13 @@ BASE_DIR_RE = re.compile(r"Base directory for this skill: [^\n]*\n\n")
 # block: this line when the skill was invoked with arguments, else nothing.
 ARGUMENTS_MARKER = "\n\nARGUMENTS: "
 
-# One status for every policy deny. Claude Code shows a 422's message as-is;
-# it replaces any 413 with its own "Request too large (max 32MB)" text and
-# prefixes a 403 with "Failed to authenticate", hiding the real reason.
-DENY_STATUS = 422
+# One status for every policy deny. Claude Code shows a 400's message as-is
+# and doesn't retry it (checked live); it replaces any 413 with its own
+# "Request too large (max 32MB)" text and prefixes a 403 with "Failed to
+# authenticate", hiding the real reason. LiteLLM derives the Anthropic error
+# type from the status, and 400 is invalid_request_error -- a 422 isn't an
+# Anthropic status, so it came out as api_error, i.e. a server fault.
+DENY_STATUS = 400
 
 
 def _header(headers: dict, name: str) -> str | None:

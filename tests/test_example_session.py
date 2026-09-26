@@ -67,7 +67,7 @@ def test_row8_edited_skill_is_denied_as_stale(gateway):
     edited = BODIES["plan"].replace("Review", "Assess")
     with pytest.raises(HTTPException) as denied:
         gateway.send(request(skill_turn("plan", body=edited)))
-    assert denied.value.status_code == 422
+    assert denied.value.status_code == 400
     assert "changed since it was hashed" in denied.value.detail
 
 
@@ -80,7 +80,7 @@ def test_row8b_appended_line_is_denied_as_stale(gateway):
 def test_row9_huge_paste_hits_the_lowest_tier_cap(gateway):
     with pytest.raises(HTTPException) as denied:
         gateway.send(request(user("x" * 200_000)))
-    assert denied.value.status_code == 422
+    assert denied.value.status_code == 400
     assert "exceeds the light tier cap (64000)" in denied.value.detail
 
 
