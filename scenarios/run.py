@@ -26,6 +26,7 @@ import json
 import os
 import pty
 import queue
+import re
 import struct
 import subprocess
 import sys
@@ -268,6 +269,11 @@ class Terminal:
     def enter(self) -> None:
         os.write(self.master, b"\r")
 
+    def screen(self, lines: int = 25) -> str:
+        """The tail of what Claude Code last drew, escape codes stripped."""
+        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[=>()][0-9A-Za-z]?", b"", bytes(self.output[-8000:]))
+        return "\n".join([line for line in text.decode(errors="replace").splitlines() if line.strip()][-lines:])
+
     def close(self) -> None:
         try:
             os.write(self.master, b"/exit\r")
@@ -377,6 +383,12 @@ def run(scenario: dict, client: Path, quick: bool) -> tuple[str, list[dict], lis
                 status = "timeout" if state["submitted"] else "not run"
                 print(f"      {status} after {STEP_TIMEOUT} s", flush=True)
             statuses.append(status)
+            if status == "not run":
+                # Claude Code isn't taking input (a dialog, a menu left open):
+                # every later step would wait out its timeout too.
+                print("      Claude Code's screen:\n" + "\n".join(f"        | {line}" for line in terminal.screen().splitlines()), flush=True)
+                print(f"      stopping: {len(steps) - len(statuses)} steps left unrun", flush=True)
+                break
         current = len(steps)  # anything still arriving belongs to no step
         time.sleep(2)
         pump()
@@ -411,6 +423,7 @@ def main() -> None:
     rows = summarize(steps, collected, prices, routes)
     transcript = find_transcript(session_id)
     checks = check_answers(steps, transcript_entries(transcript)) if transcript else [None] * len(steps)
+    statuses += ["not run"] * (len(rows) - len(statuses))  # steps left after a stop
     for row, check, status in zip(rows, checks, statuses):
         row["check"] = check
         row["status"] = status

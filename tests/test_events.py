@@ -76,7 +76,7 @@ def test_spend_event_is_rendered(gateway, capsys):
         (lambda: subagent_request(), "subagent", "moderate"),
         (lambda: compaction_request(skill_turn("plan"), assistant(), user("go")), "compaction", "complex · plan"),
         (lambda: request(skill_turn("plan"), assistant(), unregistered_turn()), "unregistered", "light · personal-notes"),
-        (lambda: permission_check_request(), "passthrough", "moderate · permission"),
+        (lambda: permission_check_request(), "permission", "moderate · permission"),
     ],
 )
 def test_every_request_type_is_rendered(gateway, capsys, build, route, where):
@@ -86,7 +86,7 @@ def test_every_request_type_is_rendered(gateway, capsys, build, route, where):
     assert where in rendered
 
 
-def test_passthrough_shows_the_model_claude_code_chose(gateway, capsys):
+def test_permission_check_shows_the_model_claude_code_chose(gateway, capsys):
     rendered = watch.render(_spend_line(gateway, capsys, gateway.send(permission_check_request())), "12:00:00", MODELS)
     assert "Sonnet 5" in rendered
 

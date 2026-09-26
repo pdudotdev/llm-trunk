@@ -38,7 +38,7 @@ SESSION_COLORS = ["36", "33", "35", "32", "34", "96", "93", "95"]
 # Each icon is a single wide (2-cell) code point, so columns stay aligned.
 ICONS = {
     "invoked": "🔖", "sticky": "📌", "untagged": "⚪",
-    "unregistered": "🔹", "subagent": "🤖", "compaction": "🧹", "passthrough": "🔒",
+    "unregistered": "🔹", "subagent": "🤖", "compaction": "🧹", "permission": "🔒",
     "denied": "⛔", "failed": "❌", "expired": "⏳",
 }
 
@@ -142,7 +142,7 @@ def route_kind(event: dict) -> str:
     if request_type == "compaction":
         return "compaction"
     if event.get("background") == "permission_check":
-        return "passthrough"
+        return "permission"
     if request_type == "skill" and event.get("unregistered_skill"):
         return "unregistered"
     if event.get("skill_id") is None:
