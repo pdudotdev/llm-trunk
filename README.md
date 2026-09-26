@@ -100,7 +100,7 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] **Deny** → stale hash or oversized input: a 400 with the reason; the request never reaches Anthropic
 - [x] After Anthropic responds, one JSON line is logged: request type, tier, session tier, skill, tokens (including cache reads and writes), cost, the model that answered and the one asked for — upstream failures (e.g. a 400 or 529) too
 
-> ⚠️ **NOTE:** Background, compaction and permission-check detection matches text Claude Code sends, so a future rewording would make those requests look like normal turns: routed to the session's tier and refreshing its timer. An undetected compaction would also be subject to the input cap again, and an undetected permission check would run on the session's tier. Neither `tests/` (which use fixed copies of these texts) nor `scripts/check_rules.py` (which judges the logged request type) would notice; after a Claude Code upgrade, check `scripts/watch.py` for the 🔒/compaction/background labels.
+> ⚠️ **NOTE:** Background, compaction and permission-check detection matches text Claude Code sends, so a future rewording would make those requests look like normal turns: routed to the session's tier and refreshing its timer. An undetected compaction would also be subject to the input cap again, and an undetected permission check would run on the session's tier. Neither `tests/` (which use fixed copies of these texts) nor `scripts/check_rules.py` (which judges the logged request type) would notice; after a Claude Code upgrade, run the [manual sanity suite](tests/sanity/manual.py) and check the 🔒/🧹/`(i)` labels.
 
 ## 🧪 Example Session
 
@@ -176,6 +176,8 @@ python3 scripts/watch.py              # live routing log (last 10 minutes, then 
 
 ▫️ **Tests** — `python3 -m pytest` (also run by CI on every push).
 
+▫️ **Manual sanity suite** — [`tests/sanity/manual.py`](tests/sanity/manual.py): 10 hands-on checks to run in Claude Code with the dashboard open (tiers, stickiness and its expiry, subagents, unregistered and edited skills, the input cap, compaction, permission checks), each with its pass criteria and why. `python3 tests/sanity/manual.py` prints it.
+
 ## 💡 Concepts 101
 
 ▫️ **Prompt caching — the `(c)` tag in the watcher**
@@ -240,7 +242,7 @@ None of them start or refresh a sticky timer — otherwise they'd keep a pricey 
 | [`scripts/report.py`](scripts/report.py) | Cost totals per request type, tier, day and session, plus estimate accuracy. |
 | [`scripts/check_rules.py`](scripts/check_rules.py) | Checks logged requests against the routing rules; non-zero exit on a violation. |
 | [`scenarios/run.py`](scenarios/run.py) · [`scenarios/dev-day.yaml`](scenarios/dev-day.yaml) | Scripted Claude Code session through the gateway, with per-step cost, answer checks, tier checks and the rule check. Results go to `scenarios/results/`. |
-| [`tests/`](tests/) | Unit and contract tests: the policy, the callback (with LiteLLM and FastAPI stubbed), the real catalog and skill files, the log-line contract with the watcher, and every tool above. |
+| [`tests/`](tests/) | Unit and contract tests: the policy, the callback (with LiteLLM and FastAPI stubbed), the real catalog and skill files, the log-line contract with the watcher, and every tool above. [`tests/sanity/manual.py`](tests/sanity/manual.py) is the manual suite (not collected by pytest). |
 
 ## ⬆️ Planned Upgrades
 - [ ] Benchmark table: the same scenario routed vs pass-through, repeated, from a cold cache
