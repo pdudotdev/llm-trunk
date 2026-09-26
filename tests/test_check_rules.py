@@ -11,6 +11,7 @@ from conftest import (
     REPO,
     assistant,
     compaction_request,
+    key,
     make_catalog,
     permission_check_request,
     request,
@@ -29,9 +30,9 @@ T0 = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
 SERVED = {"light": "claude-haiku-4-5-20251001", "moderate": "claude-sonnet-5", "complex": "claude-opus-5-5"}
 
 
-def _logged(gateway, data, capsys) -> dict:
+def _logged(gateway, data, capsys, api_key=None) -> dict:
     """Send a request through the gateway and return the spend event it logs."""
-    sent = gateway.send(data)
+    sent = gateway.send(data, api_key)
     fields = sent["litellm_metadata"]["skill_routing"]
     capsys.readouterr()
     usage = types.SimpleNamespace(prompt_tokens=1000, completion_tokens=10)
@@ -61,6 +62,15 @@ def test_a_whole_session_through_the_gateway_breaks_no_rule(gateway, capsys):
     events = [(T0, "spend", _logged(gateway, data, capsys)) for data in steps]
     result = check_rules.check(events, make_catalog(), TIER_MODELS)
     assert result == {"checked": len(steps), "skipped": 0, "catalog_changed": 0, "violations": []}
+
+
+def test_a_permission_check_held_to_the_keys_ceiling_breaks_no_rule(gateway, capsys):
+    # The gateway keeps a restricted key's permission check within the tiers
+    # its skills reach; the checker must agree rather than expect Opus's tier.
+    event = _logged(gateway, permission_check_request(), capsys, key(allowed_skills=["verify"]))
+    assert event["tier"] == "light" and event["ceiling"] == "light"
+    result = check_rules.check([(T0, "spend", event)], make_catalog(), TIER_MODELS)
+    assert result["violations"] == []
 
 
 def _event(**fields):
@@ -130,7 +140,12 @@ def _results_file(tmp_path, events):
 def _cli(*args):
     import subprocess
 
-    return subprocess.run([sys.executable, str(REPO / "scripts" / "check_rules.py"), *args], capture_output=True, text=True)
+    import os
+
+    # It prints ✗ and —; don't let the runner's locale turn that into a crash (exit 1).
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    return subprocess.run([sys.executable, str(REPO / "scripts" / "check_rules.py"), *args],
+                          capture_output=True, text=True, encoding="utf-8", env=env)
 
 
 def test_cli_exits_zero_when_every_request_follows_the_rules(tmp_path):

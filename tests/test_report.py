@@ -1,6 +1,9 @@
 """scripts/report.py: totals from the same log lines the watcher reads."""
 import json
 import sys
+import time
+
+import pytest
 
 from conftest import REPO
 
@@ -35,7 +38,17 @@ def test_parse_keeps_only_llm_trunk_events():
     assert kinds == ["spend", "spend", "spend", "spend", "deny", "failed", "expired"]
 
 
-def test_summarize_totals():
+@pytest.fixture
+def utc(monkeypatch):
+    # Days are bucketed in local time; pin it so dates hold in any timezone.
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_summarize_totals(utc):
     summary = report.summarize(report.parse(LINES))
     # Old-format lines: an invocation is a skill, a sticky follow-up is normal, the title is background.
     assert summary["types"]["skill"]["requests"] == 1 and round(summary["types"]["skill"]["cost"], 3) == 0.25

@@ -41,7 +41,9 @@ def _log_spend(gateway, data, cost=0.0123):
     usage = types.SimpleNamespace(
         prompt_tokens=41000, completion_tokens=250, cache_read_input_tokens=40000, cache_creation_input_tokens=500
     )
-    response = types.SimpleNamespace(usage=usage, model="claude-opus-5-5-20260915")
+    # Answered by the model the request's tier runs, as Anthropic would.
+    served = {"light": "claude-haiku-4-5-20251001", "moderate": "claude-sonnet-5", "complex": "claude-opus-5-5-20260915"}
+    response = types.SimpleNamespace(usage=usage, model=served.get(data["model"], "claude-opus-5-5-20260915"))
     asyncio.run(gateway.callback.async_log_success_event(kwargs, response, None, None))
 
 

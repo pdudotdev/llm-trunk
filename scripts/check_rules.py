@@ -56,11 +56,14 @@ def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[st
     session_tier = event.get("session_tier") or lowest(catalog)
     background = event.get("background")
     if background == "permission_check":
+        # Never above the highest tier the key could reach with a skill.
+        order = catalog["order"]
+        ceiling = event.get("ceiling") if event.get("ceiling") in order else order[-1]
         wanted = model_key(event.get("requested_model"))
-        for tier in reversed(catalog["order"]):
+        for tier in reversed(order[: order.index(ceiling) + 1]):
             if model_key(tier_models.get(tier)) == wanted:
                 return tier, "permission check -> tier running the model asked for"
-        return catalog["order"][-1], "permission check -> most capable tier"
+        return ceiling, "permission check -> most capable tier the key can reach"
     if background == "title":
         return lowest(catalog), "session title -> lowest tier"
     if kind == "skill" and event.get("unregistered_skill"):

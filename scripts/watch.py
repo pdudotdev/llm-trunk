@@ -173,8 +173,10 @@ def tier_text(event: dict) -> str:
 
 
 def model_cells(event: dict, models: dict[str, str]) -> list[str]:
+    # The model that answered, as logged; the tier's current model only for
+    # old lines that didn't log one.
     alias = event.get("alias") or "?"
-    model = models.get(alias) or pretty_model(alias)  # a passed-through request carries a model id
+    model = pretty_model(event["model"]) if event.get("model") else models.get(alias) or pretty_model(alias)
     text = f"{model} · {event['effort']}" if event.get("effort") else model
     _, width, _ = COLUMNS[4]
     where = tier_text(event)

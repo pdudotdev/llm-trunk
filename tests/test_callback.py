@@ -582,10 +582,20 @@ def test_logged_session_label_is_the_session_id_prefix(gateway):
 
 
 def test_sticky_time_left_is_logged(gateway):
-    fields = routing(gateway.send(request(skill_turn("plan"))))
-    left = fields["sticky_expires_at"] - cb.time.time()
+    def logged(data):
+        return cb.SkillRoutingCallback._routing_fields({"litellm_params": {"metadata": data["litellm_metadata"]}})
+
+    left = logged(gateway.send(request(skill_turn("plan"))))["sticky_left_s"]
     assert cb.STICKY_IDLE_TIMEOUT_SECONDS - 1 <= left <= cb.STICKY_IDLE_TIMEOUT_SECONDS
-    assert routing(gateway.send(request(user("hi"), session="s2")))["sticky_expires_at"] is None
+    assert logged(gateway.send(request(user("hi"), session="s2")))["sticky_left_s"] is None
+
+
+def test_routing_is_found_for_a_request_that_failed_inside_litellm(gateway):
+    # Failing before LiteLLM copies litellm_metadata over, params["metadata"]
+    # holds Claude Code's own metadata instead.
+    sent = gateway.send(request(user("hi")))
+    kwargs = {"litellm_params": {"metadata": {"user_id": "x"}, "litellm_metadata": sent["litellm_metadata"]}}
+    assert cb.SkillRoutingCallback._routing_fields(kwargs)["tier"] == sent["model"]
 
 
 def test_title_needs_both_no_tools_and_the_title_prompt(gateway):

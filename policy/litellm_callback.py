@@ -314,7 +314,8 @@ BACKGROUND_PREFIXES = {
 TITLE_PREFIX = "<session>"
 # Auto mode's permission classifier (checked on the wire): Claude Code picks
 # its model on purpose, and a weaker one would weaken the safety check, so it
-# passes through untouched.
+# goes to the tier running that model (within the key's reach) with Claude
+# Code's own effort.
 PERMISSION_CHECK_MARKER = "You are a security monitor for autonomous AI coding agents"
 # /compact and auto-compaction resend the conversation with this block
 # appended to the newest user turn (checked on the wire).
@@ -626,6 +627,7 @@ class SkillRoutingCallback(CustomLogger):
             data["model"] = tier
             data.setdefault("litellm_metadata", {})["skill_routing"] = {
                 **routing, "skill_id": None, "alias": tier, "tier": tier, "effort": None, "sticky_expires_at": None,
+                "ceiling": ceiling,
             }
             return data
 
@@ -705,8 +707,18 @@ class SkillRoutingCallback(CustomLogger):
 
     @staticmethod
     def _routing_fields(kwargs) -> dict | None:
-        metadata = kwargs.get("litellm_params", {}).get("metadata", {}) or {}
-        routing = metadata.get("skill_routing")
+        # LiteLLM copies litellm_metadata into litellm_params["metadata"] on the
+        # way to the provider; a request that fails inside LiteLLM before that
+        # still carries it only where the pre-call hook put it.
+        params = kwargs.get("litellm_params", {}) or {}
+        routing = next(
+            (
+                source.get("skill_routing")
+                for source in (params.get("metadata"), params.get("litellm_metadata"), kwargs.get("litellm_metadata"))
+                if isinstance(source, dict) and source.get("skill_routing")
+            ),
+            None,
+        )
         if not routing:
             return None
         expires_at = routing.get("sticky_expires_at")
@@ -725,6 +737,7 @@ class SkillRoutingCallback(CustomLogger):
             "session_tier": routing.get("session_tier"),
             "agent": routing.get("agent"),
             "unregistered_skill": routing.get("unregistered_skill"),
+            "ceiling": routing.get("ceiling"),
         }
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:

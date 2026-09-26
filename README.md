@@ -13,30 +13,31 @@ Tier-based routing gateway for Claude Code, built on [LiteLLM](https://docs.lite
 - [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml` — an unregistered skill gets no tier of its own and goes to the lowest
 
 ```
-   registered skills      unregistered skills        subagents        compaction,
-    (catalog.yaml)          and plain chat                        suggestions, recaps
-__________▼_____________________▼______________________▼___________________▼__________
-\                    │                     │                     │                    /
- \  hash verified →  │  lowest tier, or    │  one tier below     │  stay on the      /
-  \  catalog tier    │  the sticky tier    │  the session        │  session's tier  /
-   \_________________│_____________________│_____________________│_________________/
-            │                   │                    │                   │
-            └───────────────────┴─────────┬──────────┴───────────────────┘
-                     ┌────────────────────┼────────────────────┐
-                     ▼                    ▼                    ▼
-                  complex              moderate              light
-                 Opus 5.5 ·           Sonnet 5 ·          Haiku 4.5 ·
-                   high                 medium                low
-                     └────────────────────┼────────────────────┘
-                                          ▼
-                                      Anthropic
+  registered skills    plain chat      unregistered       subagents      compaction,       permission
+   (catalog.yaml)                     skills, titles                    suggestions,         checks
+                                                                           recaps
+__________▼_________________▼________________▼________________▼_______________▼_________________▼__________
+\   hash verified   │ sticky tier,  │   lowest tier  │ one tier below │ the session's │   tier running    /
+ \ → catalog tier   │  else lowest  │                │   the session  │     tier      │     the model    /
+  \                 │               │                │   (then kept)  │               │     asked for   /
+   \________________│_______________│________________│________________│_______________│________________/
+          │                 │                │                │               │                 │
+          └─────────────────┴────────────────┴───────┬────────┴───────────────┴─────────────────┘
+                                ┌────────────────────┼────────────────────┐
+                                ▼                    ▼                    ▼
+                             complex              moderate              light
+                            Opus 5.5 ·           Sonnet 5 ·          Haiku 4.5 ·
+                               high                medium                low
+                                └────────────────────┼────────────────────┘
+                                                     ▼
+                                                 Anthropic
 ```
 
 ▫️ **"VLAN hopping" protection:**
 - [x] Can't fake a tag — a registered skill with a wrong hash is denied
 - [x] Headers can't claim one — `x-skill-id`/`x-skill-hash` are only honored from a key with `metadata: {"trust_skill_headers": true}`; no key has it today
 - [x] A forged body is handled per key, like per-port VLAN filtering — the hash isn't secret (anyone can read the skill files), so each key's `allowed_skills` metadata decides which skills can lift it above the lowest tier; anything else is treated as unregistered
-- [x] A forged permission check gains nothing either — it never reaches a tier the key couldn't reach with a skill, and keeps that tier's input cap
+- [x] A forged permission check is bounded too — it never reaches a tier the key couldn't reach with a skill and keeps that tier's input cap. It does keep Claude Code's own effort and up to 8,192 output tokens, as real permission checks need
 
 ## 📖 **Table of Contents**
 - 🔀 **llm-trunk**
@@ -99,7 +100,7 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] **Deny** → stale hash or oversized input: a 422 with the reason; the request never reaches Anthropic
 - [x] After Anthropic responds, one JSON line is logged: request type, tier, session tier, skill, tokens (including cache reads and writes), cost, the model that answered and the one asked for — upstream failures (e.g. a 400 or 529) too
 
-> ⚠️ **NOTE:** Background, compaction and permission-check detection matches text Claude Code sends, so a future rewording would make those requests look like normal turns: routed to the session's tier and refreshing its timer. An undetected compaction would also be subject to the input cap again, and an undetected permission check would run on the session's tier — `tests/` and `scripts/check_rules.py` are how you'd notice.
+> ⚠️ **NOTE:** Background, compaction and permission-check detection matches text Claude Code sends, so a future rewording would make those requests look like normal turns: routed to the session's tier and refreshing its timer. An undetected compaction would also be subject to the input cap again, and an undetected permission check would run on the session's tier. Neither `tests/` (which use fixed copies of these texts) nor `scripts/check_rules.py` (which judges the logged request type) would notice; after a Claude Code upgrade, check `scripts/watch.py` for the 🔒/compaction/background labels.
 
 ## 🧪 Example Session
 
@@ -169,7 +170,7 @@ python3 scripts/watch.py              # live routing log (last 10 minutes, then 
 
 ▫️ **Scripted scenario** — `python3 scenarios/run.py` drives a real, interactive Claude Code session through the gateway ([`scenarios/dev-day.yaml`](scenarios/dev-day.yaml): every request type on every tier, plus an idle gap past the cache). Each step is confirmed in Claude Code's own transcript, its answer is checked, its tier verified, and the whole session is run through the rule checker. `--quick` skips the idle gap; `--cold-start` first waits for the prompt cache to expire, so runs are comparable. It uses real tokens: about $1–2 per run on the gateway's key.
 
-▫️ **Rule checker** — `python3 scripts/check_rules.py` checks every logged request against the routing rules above, including that the model that answered is the tier's. Exits non-zero on any violation. It only sees what the gateway logs: a request LiteLLM rejects before the routing callback runs (e.g. an unknown model name) never reaches the log.
+▫️ **Rule checker** — `python3 scripts/check_rules.py` checks every logged request against the routing rules above, including that the model that answered is the tier's. Exits non-zero on any violation. It only sees what the gateway logs: a request LiteLLM rejects before the routing callback runs (e.g. a bad or missing key) never reaches the log.
 
 ▫️ **Cost report** — `python3 scripts/report.py` totals the gateway log per request type, tier, day and session.
 
