@@ -41,6 +41,7 @@ __________▼_________________▼________________▼________________▼_________
   - [🔀 How It Works](#-how-it-works)
   - [🧪 Example Session](#-example-session)
   - [🚀 Installation & Usage](#-installation--usage)
+  - [⚠️ Limitations](#️-limitations)
   - [📊 Measuring It](#-measuring-it)
   - [💡 Concepts 101](#-concepts-101)
   - [📂 Project Files](#-project-files)
@@ -185,6 +186,11 @@ python3 scripts/dashboard.py                # terminal 2, in llm-trunk: live cos
 > ⚠️ **NOTE:** Changes to `catalog.yaml` apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
 
 > ⚠️ **NOTE:** The routing history is kept in the gateway container's log. `docker compose down` erases it.
+
+## ⚠️ Limitations
+
+▫️ **Desktop Code tab:**
+The Claude Desktop app's Code tab ignores a project's `settings.json`, so it cannot be routed per-repo. Desktop Code sessions always use your default settings (subscription or machine-wide). To use the gateway with a project, use the **CLI** (`claude` command) or the **VS Code extension** instead.
 
 ## 📊 Measuring It
 
