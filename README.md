@@ -33,12 +33,6 @@ __________▼_________________▼________________▼________________▼_________
                                                  Anthropic
 ```
 
-▫️ **"VLAN hopping" protection:**
-- [x] Can't fake a tag — a registered skill with a wrong hash is denied
-- [x] Headers can't claim one — `x-skill-id`/`x-skill-hash` are only honored from a key with `metadata: {"trust_skill_headers": true}`; no key has it today
-- [x] A forged body is handled per key, like per-port VLAN filtering — the hash isn't secret (anyone can read the skill files), so each key's `allowed_skills` metadata decides which skills can lift it above the lowest tier; anything else is treated as unregistered
-- [x] A forged permission check is bounded too — it never reaches a tier the key couldn't reach with a skill and keeps that tier's input cap. It does keep Claude Code's own effort and up to 8,192 output tokens, as real permission checks need
-
 ## 📖 **Table of Contents**
 - 🔀 **llm-trunk**
   - [🔭 Overview](#-overview)
@@ -101,6 +95,11 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] After Anthropic responds, one JSON line is logged: request type, tier, session tier, skill, tokens (including cache reads and writes), cost, the model that answered and the one asked for — upstream failures (e.g. a 400 or 529) too
 
 > ⚠️ **NOTE:** Background, compaction and permission-check detection matches text Claude Code sends, so a future rewording would make those requests look like normal turns: routed to the session's tier and refreshing its timer. An undetected compaction would also be subject to the input cap again, and an undetected permission check would run on the session's tier. Neither `tests/` (which use fixed copies of these texts) nor `scripts/check_rules.py` (which judges the logged request type) would notice; after a Claude Code upgrade, run the [manual sanity suite](tests/sanity/manual.py) and check the 🔒/🧹/`(i)` labels.
+
+▫️ **Who can reach which tier (keys):**
+- [x] **A skill's hash isn't a secret** — anyone can read the skill files, so any client can send a registered skill's exact body and get its tier. Each key's `allowed_skills` metadata decides which skills can lift it above the lowest tier, like per-port VLAN filtering; any other skill is treated as unregistered. A key without it can reach every tier
+- [x] **Headers don't count by default** — `x-skill-id`/`x-skill-hash` are only honored from a key with `metadata: {"trust_skill_headers": true}`; no key has it today
+- [x] **Permission checks stay within the key's reach** — a forged one never reaches a tier the key couldn't reach with a skill, and keeps that tier's input cap. It does keep Claude Code's own effort and up to 8,192 output tokens, as real permission checks need
 
 ## 🧪 Example Session
 
