@@ -1,10 +1,10 @@
 model_list:
   - model_name: qa-test-plan-creation
     litellm_params:
-      model: anthropic/claude-opus-5
+      model: anthropic/claude-opus-5-5
       api_key: os.environ/ANTHROPIC_API_KEY
-      input_cost_per_token: 0.000005
-      output_cost_per_token: 0.000025
+      input_cost_per_token: 0.000004
+      output_cost_per_token: 0.00002
 
   - model_name: qa-test-case-execution
     litellm_params:

@@ -123,7 +123,7 @@ def test_render_shows_savings_lanes_sessions_and_feed():
     clock.now += 120
     screen = _screen(dash)
     saved_share = dash.saved / dash.compared_without
-    assert "SAVED vs requested models" in screen and f"{-saved_share:+.0%}" in screen
+    assert "SAVED $0.0" in screen and f"{saved_share:.0%} cheaper than the models Claude Code asked for" in screen
     assert "plan" in screen and "untagged" in screen
     assert "warm 3:00" in screen
     assert "invoked" in screen and "denied" in screen and "Opus 5.5 · low" in screen
@@ -133,3 +133,39 @@ def test_render_before_any_comparable_traffic():
     dash = _dashboard()
     dash.add(T0, "spend", _spend(requested_model=None))
     assert "no requests with a recorded client model yet" in _screen(dash)
+
+
+@pytest.mark.parametrize(
+    ("saving", "text"),
+    [(None, "—"), (0.001, "—"), (0.75, "saved 75%"), (-0.9, "⚠ +90% cost")],
+)
+def test_vs_asked_labels(saving, text):
+    assert dashboard.vs_asked(saving).plain == text
+
+
+def test_lane_that_costs_more_than_asked_is_flagged():
+    # What the live run found: Claude Code asked for Opus 5.5, the plan lane ran Opus 5.
+    routes = {**ROUTES, "plan-lane": "anthropic/claude-opus-5"}
+    dash = dashboard.Dashboard(PRICES, routes, 300, Clock())
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05, cache_read_tokens=0))
+    assert dash.saved < 0
+    assert dash.lane_saving("plan") == pytest.approx(-0.25)  # Opus 5 is 25% pricier on uncached tokens
+    screen = _screen(dash)
+    assert "COSTING $" in screen and "MORE" in screen
+    assert "⚠ +25% cost" in screen  # in the lane panel and the feed
+
+
+def test_logged_model_wins_over_current_lane_config():
+    # History stays true after a lane is re-pointed: this request really ran on Opus 5.
+    dash = _dashboard()  # ROUTES now point plan-lane at Opus 5.5
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05,
+                                 cache_read_tokens=0, model="claude-opus-5-20260101"))
+    assert dash.lane_saving("plan") == pytest.approx(-0.25)
+    assert dash.sessions["s1"]["model"] == "claude-opus-5-20260101"
+
+
+def test_unpriceable_logged_model_falls_back_to_lane_config():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(model="qa-test-plan-creation"))  # e.g. an alias instead of a model id
+    assert dash.sessions["s1"]["model"] == ROUTES["untagged"]
+    assert dash.compared == 1

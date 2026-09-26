@@ -30,7 +30,8 @@ def _log_spend(gateway, data, cost=0.0123):
     usage = types.SimpleNamespace(
         prompt_tokens=41000, completion_tokens=250, cache_read_input_tokens=40000, cache_creation_input_tokens=500
     )
-    asyncio.run(gateway.callback.async_log_success_event(kwargs, types.SimpleNamespace(usage=usage), None, None))
+    response = types.SimpleNamespace(usage=usage, model="claude-opus-5-5-20260915")
+    asyncio.run(gateway.callback.async_log_success_event(kwargs, response, None, None))
 
 
 def test_spend_event_is_rendered(gateway, capsys):
@@ -42,6 +43,7 @@ def test_spend_event_is_rendered(gateway, capsys):
     assert event["skill_id"] == "plan" and event["alias"] == "plan-lane" and event["effort"] == "high"
     assert (event["input_tokens"], event["output_tokens"], event["cache_read_tokens"]) == (41000, 250, 40000)
     assert event["cache_write_tokens"] == 500
+    assert event["model"] == "claude-opus-5-5-20260915"  # what actually answered
     assert event["requested_model"] == "claude-sonnet-5"  # what the client asked for, before the lane
     assert event["cost"] == 0.0123
     rendered = watch.render(line, "12:00:00", MODELS)

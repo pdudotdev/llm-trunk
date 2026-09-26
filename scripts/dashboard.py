@@ -94,6 +94,15 @@ def without_trunk(event: dict, routed_model: str | None, prices: dict) -> float 
     return actual * on_requested / on_routed if isinstance(actual, (int, float)) else on_requested
 
 
+def served_model(event: dict, routes: dict, prices: dict) -> str | None:
+    """The model that answered: logged per request when it's one we can price,
+    else the lane's current model from litellm/config.yaml."""
+    logged = event.get("model")
+    if logged and model_key(logged) in prices:
+        return logged
+    return routes.get(event.get("alias") or "")
+
+
 # --- State -----------------------------------------------------------------------
 
 
@@ -107,6 +116,8 @@ class Dashboard:
         self.compared_actual = self.compared_without = 0.0
         self.input_tokens = self.cached_tokens = 0
         self.lane_cost: dict[str, float] = defaultdict(float)
+        # lane -> [actual, without llm-trunk], over comparable requests only
+        self.lane_compare: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self.sessions: dict[str, dict] = {}
         self.feed: deque = deque(maxlen=FEED_ROWS)
 
@@ -123,7 +134,7 @@ class Dashboard:
         logged = event.get("cost")
         cost = float(logged) if isinstance(logged, (int, float)) else 0.0
         lane = event.get("skill_id") or "untagged"
-        routed_model = self.routes.get(event.get("alias") or "")
+        routed_model = served_model(event, self.routes, self.prices)
         self.requests += 1
         self.actual += cost
         self.lane_cost[lane] += cost
@@ -143,11 +154,18 @@ class Dashboard:
         self.compared += 1
         self.compared_actual += cost
         self.compared_without += baseline
+        self.lane_compare[lane][0] += cost
+        self.lane_compare[lane][1] += baseline
         return (baseline - cost) / baseline if baseline else None
 
     @property
     def saved(self) -> float:
         return self.compared_without - self.compared_actual
+
+    def lane_saving(self, lane: str) -> float | None:
+        """Share saved on this lane vs the models asked for; negative = costs more."""
+        actual, without = self.lane_compare.get(lane, (0.0, 0.0))
+        return (without - actual) / without if without else None
 
     def cache_state(self, session: dict) -> tuple[bool, int, float | None, float | None]:
         """(warm, seconds left, next message if warm, next message if cold)."""
@@ -171,15 +189,29 @@ def _model_text(model: str | None, effort: str | None = None) -> Text:
     return Text(f"{name} · {effort}" if effort else name, style=MODEL_STYLES.get(name.split(" ")[0], ""))
 
 
+def vs_asked(saving: float | None) -> Text:
+    """A request's or lane's cost vs the model Claude Code asked for."""
+    if saving is None or abs(saving) < 0.005:
+        return Text("—", style="dim")
+    if saving > 0:
+        return Text(f"saved {saving:.0%}", style="green")
+    return Text(f"⚠ +{-saving:.0%} cost", style="bold red")
+
+
 def header(dash: Dashboard) -> Panel:
     title = Text("🔀 llm-trunk · live", style="bold")
     if dash.compared and dash.compared_without:
-        share = dash.saved / dash.compared_without
-        headline = Text.assemble(
-            ("SAVED vs requested models   ", "bold"),
-            (_money(dash.saved), "bold green" if dash.saved >= 0 else "bold red"),
-            (f"  ({-share:+.0%})", "green" if dash.saved >= 0 else "red"),
-        )
+        share = abs(dash.saved) / dash.compared_without
+        if dash.saved >= 0:
+            headline = Text.assemble(
+                ("SAVED ", "bold"), (_money(dash.saved), "bold green"),
+                (f"  ·  {share:.0%} cheaper than the models Claude Code asked for", "green"),
+            )
+        else:
+            headline = Text.assemble(
+                ("COSTING ", "bold"), (_money(-dash.saved), "bold red"),
+                (f" MORE  ·  +{share:.0%} vs the models Claude Code asked for", "red"),
+            )
         detail = Text(
             f"actual {_money(dash.compared_actual)}  ·  without llm-trunk ≈ {_money(dash.compared_without)}"
             f"  ·  {dash.compared} of {dash.requests} requests comparable",
@@ -196,33 +228,36 @@ def lanes_panel(dash: Dashboard) -> Panel:
     table = Table.grid(padding=(0, 1))
     table.add_column(no_wrap=True)
     table.add_column(no_wrap=True)
-    table.add_column(justify="right")
-    table.add_column(justify="right", style="dim")
+    table.add_column(justify="right", no_wrap=True)
+    table.add_column(justify="right", style="dim", no_wrap=True)
+    table.add_column(justify="right", no_wrap=True)
     for lane, cost in sorted(dash.lane_cost.items(), key=lambda item: -item[1])[:6]:
         share = cost / dash.actual if dash.actual else 0
-        bar = "█" * round(share * 16)
-        table.add_row(lane[:22], Text(bar.ljust(16), style="cyan"), f"{share:.0%}", _money(cost))
-    table.add_row("", "", "", "")
+        bar = "█" * round(share * 8)
+        table.add_row(lane[:21], Text(bar.ljust(8), style="cyan"), f"{share:.0%}", _money(cost), vs_asked(dash.lane_saving(lane)))
+    table.add_row("", "", "", "", "")
     hit = dash.cached_tokens / dash.input_tokens if dash.input_tokens else 0
-    table.add_row("input from cache", Text(("█" * round(hit * 16)).ljust(16), style="green"), f"{hit:.0%}", "")
+    table.add_row("input from cache", Text(("█" * round(hit * 8)).ljust(8), style="green"), f"{hit:.0%}", "", "")
     background = dash.background_cost / dash.actual if dash.actual else 0
-    table.add_row("background calls", Text(("█" * round(background * 16)).ljust(16), style="yellow"), f"{background:.0%}", _money(dash.background_cost))
-    table.add_row("denied", "", str(dash.denies), "")
-    return Panel(table, title="spend by lane", title_align="left")
+    table.add_row("background calls", Text(("█" * round(background * 8)).ljust(8), style="yellow"), f"{background:.0%}", _money(dash.background_cost), "")
+    table.add_row("denied", "", str(dash.denies), "", "")
+    return Panel(table, title="spend by lane · vs model asked for", title_align="left")
 
 
 def sessions_panel(dash: Dashboard) -> Panel:
     table = Table.grid(padding=(0, 1))
+    for _ in range(4):
+        table.add_column(no_wrap=True, overflow="ellipsis")
     recent = sorted(dash.sessions.items(), key=lambda item: -item[1]["last"])[:SESSION_ROWS]
     for session, state in recent:
         warm, left, if_warm, if_cold = dash.cache_state(state)
-        status = Text(f"● warm {left // 60}:{left % 60:02d}", style="green") if warm else Text("○ COLD", style="bold red")
-        if if_warm is None:
+        status = Text(f"● warm {left // 60}:{left % 60:02d}", style="green") if warm else Text("○ cold", style="bold red")
+        if if_warm is None or if_cold is None:
             next_message = Text("")
         elif warm:
-            next_message = Text(f"next msg {_money(if_warm)} (cold: {_money(if_cold)})", style="dim")
+            next_message = Text(f"next {_money(if_warm)} · cold {_money(if_cold)}", style="dim")
         else:
-            next_message = Text(f"next msg re-caches: {_money(if_cold)}", style="red")
+            next_message = Text(f"next re-caches {_money(if_cold)}", style="red")
         table.add_row(Text(session, style="bold"), _model_text(state["model"]), status, next_message)
     if not recent:
         table.add_row(Text("no sessions yet", style="dim"))
@@ -232,7 +267,7 @@ def sessions_panel(dash: Dashboard) -> Panel:
 def feed_panel(dash: Dashboard) -> Panel:
     table = Table(box=None, padding=(0, 1), show_edge=False, header_style="dim")
     for name, justify in (("TIME", "left"), ("ROUTE", "left"), ("LANE", "left"), ("MODEL · EFFORT", "left"),
-                          ("INPUT", "right"), ("COST", "right"), ("SAVED", "right")):
+                          ("INPUT", "right"), ("COST", "right"), ("VS ASKED", "right")):
         table.add_column(name, justify=justify, no_wrap=True)
     for when, kind, event, saving in dash.feed:
         clock = f"{when:%H:%M:%S}"
@@ -243,15 +278,11 @@ def feed_panel(dash: Dashboard) -> Panel:
             tokens = event.get("input_tokens")
             size = fmt_tokens(tokens) + (" (c)" if tokens and cached * 2 >= tokens else "")
             cost = event.get("cost")
-            if saving is None or abs(saving) < 0.005:
-                saved = Text("—", style="dim")
-            else:
-                saved = Text(f"{-saving:+.0%}", style="green" if saving > 0 else "red")
             table.add_row(
                 Text(clock, style="dim"), Text(label, style="bold" if route == "invoked" else ""),
                 event.get("skill_id") or "untagged",
-                _model_text(dash.routes.get(event.get("alias") or ""), event.get("effort")),
-                size, _money(cost) if isinstance(cost, (int, float)) else "—", saved,
+                _model_text(served_model(event, dash.routes, dash.prices), event.get("effort")),
+                size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
             )
         elif kind == "deny":
             reason = str(event.get("reason", "")).removeprefix("llm-trunk: ")

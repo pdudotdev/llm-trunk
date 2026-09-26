@@ -67,7 +67,7 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 - [x] **Local lab, not production** — one Mac, Docker Compose, no auth beyond LiteLLM's own keys
 
 ▫️ **Model tiers:**
-- [x] Opus 5 — test-plan creation (high effort)
+- [x] Opus 5.5 — test-plan creation (high effort)
 - [x] Sonnet 5 — test execution (medium), bug logging (low)
 - [x] Haiku 4.5 — fix verification, untagged (low)
 
