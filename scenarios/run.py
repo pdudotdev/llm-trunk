@@ -44,6 +44,7 @@ from watch import pretty_model  # noqa: E402
 GATEWAY = "http://127.0.0.1:4000"
 QUIET_SECONDS = 8  # a suggestion lands a few seconds after the reply
 STEP_TIMEOUT = 300
+RESEND_AFTER = 15  # a prompt that hasn't registered by then gets one more Enter
 # Set inside a Claude Code session; a nested `claude` would inherit them.
 NESTED_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
 
@@ -58,13 +59,36 @@ def load(path: Path) -> dict:
     return scenario
 
 
-def step_finished(events: list[tuple[float, str, dict]], now: float, quiet: float = QUIET_SECONDS) -> bool:
+def answered(events: list[tuple[float, str, dict]]) -> bool:
     """events: (arrival time, kind, event) for this step, oldest first."""
-    answered = any(
+    return any(
         kind in ("deny", "failed") or (kind == "spend" and not event.get("background"))
         for _, kind, event in events
     )
-    return answered and now - events[-1][0] >= quiet
+
+
+def gateway_quiet(events: list[tuple[float, str, dict]], now: float, quiet: float = QUIET_SECONDS) -> bool:
+    return not events or now - events[-1][0] >= quiet
+
+
+def transcript_state(records: list[dict], since: int) -> dict:
+    """What the main conversation has done since record `since`.
+
+    Claude Code writes a `turn_duration` record when a turn ends and a
+    `compact_boundary` record when compaction really ran -- firmer signals
+    than timing, and the only way to tell a prompt that never registered.
+    Subagent records (isSidechain) don't count.
+    """
+    main = [(index, record) for index, record in enumerate(records) if not record.get("isSidechain")]
+    new = [record for index, record in main if index >= since]
+    compacted = any(record.get("subtype") == "compact_boundary" for record in new)
+    last_turn_end = max((index for index, record in main if record.get("subtype") == "turn_duration"), default=-1)
+    last_message = max((index for index, record in main if record.get("type") in ("user", "assistant")), default=-1)
+    return {
+        "submitted": compacted or any(record.get("type") == "user" for record in new),
+        "compacted": compacted,
+        "idle": last_turn_end > last_message,
+    }
 
 
 def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], prices: dict, routes: dict) -> list[dict]:
@@ -165,6 +189,28 @@ def find_transcript(session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def read_records(path: Path | None) -> list[dict]:
+    if path is None or not path.exists():
+        return []
+    records = []
+    for line in path.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # the last line can be half-written
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def subagents_last_active(path: Path | None) -> float:
+    """When any of the session's subagents last wrote to its transcript."""
+    if path is None:
+        return 0.0
+    files = list(path.with_suffix("").glob("subagents/*.jsonl"))
+    return max((file.stat().st_mtime for file in files), default=0.0)
+
+
 # --- Driving Claude Code -----------------------------------------------------------
 
 
@@ -196,6 +242,9 @@ class Terminal:
     def type(self, text: str) -> None:
         os.write(self.master, text.encode())
         time.sleep(0.4)
+        self.enter()
+
+    def enter(self) -> None:
         os.write(self.master, b"\r")
 
     def close(self) -> None:
@@ -215,7 +264,7 @@ def gateway_up() -> bool:
         return False
 
 
-def run(scenario: dict, client: Path, quick: bool) -> tuple[str, list[dict], list[tuple[float, str, dict, int]]]:
+def run(scenario: dict, client: Path, quick: bool) -> tuple[str, list[dict], list[tuple[float, str, dict, int]], list[str]]:
     steps = [step for step in scenario["steps"] if not (quick and step["type"] == "idle")]
     session_id = str(uuid.uuid4())
     short = session_id[:8]
@@ -225,6 +274,7 @@ def run(scenario: dict, client: Path, quick: bool) -> tuple[str, list[dict], lis
     threading.Thread(target=dashboard.stream, args=(since, events, stop), daemon=True).start()
 
     collected: list[tuple[float, str, dict, int]] = []
+    statuses: list[str] = []
     current = 0
 
     def pump() -> None:
@@ -245,25 +295,47 @@ def run(scenario: dict, client: Path, quick: bool) -> tuple[str, list[dict], lis
                 while time.time() - started < step["wait_seconds"]:
                     time.sleep(1)
                     pump()
+                statuses.append("ok")
                 continue
             print(f"{label}: {step['send'][:70]}", flush=True)
             first = len(collected)
+            transcript = find_transcript(session_id)
+            baseline = len(read_records(transcript))
             terminal.type(step["send"])
+            resent, status = False, "timeout"
             while time.time() - started < STEP_TIMEOUT:
                 time.sleep(0.5)
                 pump()
+                now = time.time()
+                transcript = transcript or find_transcript(session_id)
+                state = transcript_state(read_records(transcript), baseline)
+                if not state["submitted"]:
+                    if not resent and now - started > RESEND_AFTER:
+                        terminal.enter()  # e.g. Enter only closed the command menu
+                        resent = True
+                        print("      prompt not registered yet, pressed Enter again", flush=True)
+                    continue
                 mine = [(arrived, kind, event) for arrived, kind, event, _ in collected[first:]]
-                if mine and step_finished(mine, time.time()):
+                agents_quiet = now - subagents_last_active(transcript) >= QUIET_SECONDS
+                if step["type"] == "compaction":
+                    done = state["compacted"] and gateway_quiet(mine, now) and agents_quiet
+                else:
+                    done = state["idle"] and answered(mine) and gateway_quiet(mine, now) and agents_quiet
+                if done:
+                    status = "ok"
                     break
             else:
-                print(f"      timed out after {STEP_TIMEOUT} s", flush=True)
+                state = transcript_state(read_records(transcript), baseline)
+                status = "timeout" if state["submitted"] else "not run"
+                print(f"      {status} after {STEP_TIMEOUT} s", flush=True)
+            statuses.append(status)
         current = len(steps)  # anything still arriving belongs to no step
         time.sleep(2)
         pump()
     finally:
         terminal.close()
         stop.set()
-    return session_id, steps, collected
+    return session_id, steps, collected, statuses
 
 
 def main() -> None:
@@ -284,13 +356,14 @@ def main() -> None:
         sys.exit(f"error: gateway not reachable at {GATEWAY} — start it with docker compose up -d")
 
     started = datetime.now()
-    session_id, steps, collected = run(scenario, Path(args.client), args.quick)
+    session_id, steps, collected, statuses = run(scenario, Path(args.client), args.quick)
     prices, routes = dashboard.load_prices(), dashboard.load_routes()
     rows = summarize(steps, collected, prices, routes)
     transcript = find_transcript(session_id)
     checks = check_answers(steps, transcript_entries(transcript)) if transcript else [None] * len(steps)
-    for row, check in zip(rows, checks):
+    for row, check, status in zip(rows, checks, statuses):
         row["check"] = check
+        row["status"] = status
 
     print_table(scenario["name"], rows)
     out = REPO / "scenarios" / "results" / f"{started:%Y%m%d-%H%M%S}-{scenario['name']}.json"
@@ -321,7 +394,9 @@ def print_table(name: str, rows: list[dict]) -> None:
         if row["denied"] or row["failed"]:
             requests += f" {row['denied'] + row['failed']}✗"
         check = row.get("check")
-        check_text = Text(check or "", style={"PASS": "green", "FAIL": "bold red"}.get(check or "", "dim"))
+        if row.get("status", "ok") != "ok":
+            check = row["status"].upper()
+        check_text = Text(check or "", style={"PASS": "green"}.get(check or "", "bold red" if check else "dim"))
         table.add_row(row["step"], row["type"], "\n".join(row["routes"]) or "—", requests, f"${row['cost']:.3f}",
                       f"${row['without']:.3f}" if row["comparable"] else "—", dashboard.vs_asked(saving), check_text)
     cost = sum(row["cost"] for row in rows)
@@ -331,7 +406,8 @@ def print_table(name: str, rows: list[dict]) -> None:
     table.add_row("TOTAL", "", "", str(sum(row["requests"] for row in rows)), f"${cost:.3f}", f"${without:.3f}",
                   dashboard.vs_asked((without - cost) / without if without else None),
                   f"{checked.count('PASS')}/{len(checked)}" if checked else "")
-    Console().print(table)
+    # Piped or redirected output defaults to 80 columns, too narrow for the table.
+    (Console() if sys.stdout.isatty() else Console(width=130)).print(table)
 
 
 if __name__ == "__main__":

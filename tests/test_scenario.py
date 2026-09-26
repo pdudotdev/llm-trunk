@@ -34,13 +34,56 @@ def test_dry_run_lists_steps_without_sending():
     assert "[idle] idle past the cache: wait 330 s" in result.stdout
 
 
-def test_step_waits_for_the_answer_then_quiet():
+def test_answer_and_quiet_on_the_gateway():
     title = (10.0, "spend", {"background": "title"})
     answer = (12.0, "spend", {"background": None})
-    assert not run.step_finished([title], now=30.0)  # background call alone isn't the answer
-    assert not run.step_finished([title, answer], now=15.0)  # answer in, not quiet yet
-    assert run.step_finished([title, answer], now=12.0 + run.QUIET_SECONDS)
-    assert run.step_finished([(5.0, "deny", {"code": "input_cap"})], now=20.0)
+    assert not run.answered([title])  # a background call alone isn't the answer
+    assert run.answered([title, answer])
+    assert run.answered([(5.0, "deny", {"code": "input_cap"})])
+    assert not run.gateway_quiet([title, answer], now=15.0)
+    assert run.gateway_quiet([title, answer], now=12.0 + run.QUIET_SECONDS)
+
+
+def _records(*kinds):
+    table = {
+        "user": {"type": "user"},
+        "assistant": {"type": "assistant"},
+        "end": {"type": "system", "subtype": "turn_duration"},
+        "compact": {"type": "system", "subtype": "compact_boundary"},
+        "summary": {"type": "user", "isCompactSummary": True},
+        "side": {"type": "assistant", "isSidechain": True},
+        "snapshot": {"type": "file-history-snapshot"},
+    }
+    return [table[kind] for kind in kinds]
+
+
+def test_transcript_state_follows_a_turn():
+    before = _records("user", "assistant", "end", "snapshot")
+    baseline = len(before)
+    assert run.transcript_state(before, baseline) == {"submitted": False, "compacted": False, "idle": True}
+    working = before + _records("user", "assistant")
+    assert run.transcript_state(working, baseline) == {"submitted": True, "compacted": False, "idle": False}
+    done = working + _records("end", "snapshot")
+    assert run.transcript_state(done, baseline)["idle"] is True
+
+
+def test_subagent_records_do_not_end_or_start_a_turn():
+    records = _records("user", "assistant", "end") + _records("side", "side")
+    assert run.transcript_state(records, 3) == {"submitted": False, "compacted": False, "idle": True}
+
+
+def test_compaction_is_only_confirmed_by_its_boundary_record():
+    before = _records("user", "assistant", "end")
+    assert not run.transcript_state(before, 3)["compacted"]
+    after = before + _records("compact", "summary")
+    assert run.transcript_state(after, 3) == {"submitted": True, "compacted": True, "idle": False}
+
+
+def test_read_records_skips_a_half_written_last_line(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_text('{"type": "user"}\n{"type": "assist')
+    assert run.read_records(path) == [{"type": "user"}]
+    assert run.read_records(tmp_path / "missing.jsonl") == []
 
 
 def _spend(**fields):
