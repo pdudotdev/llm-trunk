@@ -7,12 +7,12 @@
 
 A routing gateway for Claude Code, built on [LiteLLM](https://docs.litellm.ai/). It sends each request to a cheaper or stronger model tier based on what the request is, and measures what that saves.
 
-A request can be a registered skill (recognized by the SHA-256 hash of its `SKILL.md`, not by guessing from the prompt), a subagent, compaction, one of Claude Code's own background calls, or plain chat. A live dashboard and a scripted scenario show each request's cost next to what it would have cost on the model Claude Code asked for.
+Skills are recognized by the SHA-256 hash of their `SKILL.md`, not by guessing from the prompt. A live dashboard shows each request's cost next to what it would have cost on the model Claude Code asked for.
 
 ▫️ **Same idea as an 802.1Q trunk port:**
-- [x] **Tagged frame** → the VLAN ID picks the VLAN. Here: a registered skill's hash picks its tier (complex / moderate / light)
-- [x] **Untagged frame** → goes to the native VLAN. Here: plain chat goes to the lowest tier (Haiku, low effort)
-- [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: `catalog.yaml`. A skill that isn't listed goes to the lowest tier
+- [x] **Tagged frame** → the VLAN ID picks the VLAN. Here: a registered skill's hash picks its tier
+- [x] **Untagged frame** → goes to the native VLAN. Here: plain chat goes to the lowest tier
+- [x] **Allowed-VLAN list** → only listed VLANs get their own path. Here: a skill missing from `catalog.yaml` goes to the lowest tier
 
 ```
   registered skills    plain chat      unregistered       subagents      compaction,       permission
@@ -51,9 +51,9 @@ __________▼_________________▼________________▼________________▼_________
 
 ## 🔭 Overview
 
-llm-trunk runs as a local proxy on `127.0.0.1:4000`, between Claude Code and Anthropic. LiteLLM does the proxying. This repo adds the **routing policy** (which tier each request gets) and the tools that measure the cost.
+llm-trunk is a local proxy on `127.0.0.1:4000`, between Claude Code and Anthropic. LiteLLM does the proxying; this repo adds the routing policy and the tools that measure its cost.
 
-▫️ **Tiers** (cheapest first; set in [`catalog.yaml`](catalog.yaml), each tier's model in [`litellm/config.yaml`](litellm/config.yaml)):
+▫️ **Tiers** (set in [`catalog.yaml`](catalog.yaml); models in [`litellm/config.yaml`](litellm/config.yaml)):
 
 | Tier | Model | Effort | Max input | Max output |
 |---|---|---|---|---|
@@ -63,71 +63,61 @@ llm-trunk runs as a local proxy on `127.0.0.1:4000`, between Claude Code and Ant
 
 ▫️ **Routing rules:**
 
-| Request type | What it is | Tier |
-|---|---|---|
-| **normal** | Your own prompts | The session's sticky tier, else `light` |
-| **skill** (registered) | A skill listed in the catalog, with a matching hash | Its catalog tier. It also becomes the session's sticky tier |
-| **skill** (unregistered) | Any other skill | `light`, and the session's sticky tier ends |
-| **subagent** | Requests from a subagent Claude Code starts | One tier below the session (never below `light`). Each subagent keeps its first tier |
-| **compaction** | `/compact` or auto-compaction | The session's tier. No input cap, so an oversized session can always be shrunk |
-| **background** | Next-prompt suggestions, away-summary recaps | The session's tier. They resend the whole conversation, so another model would have to re-cache it |
-| | Session titles | `light` (about 1k tokens, nothing cached) |
-| | Auto mode's permission checks | The tier running the model Claude Code asked for, so the safety check isn't weakened. Never above what the key could reach with a skill |
+| Request | Tier |
+|---|---|
+| Your own messages | The session's sticky tier, else `light` |
+| A registered skill | Its catalog tier, which becomes the session's sticky tier |
+| An unregistered skill | `light`, and the sticky tier ends |
+| Subagents | One tier below the session (never below `light`); each keeps its first tier |
+| Compaction (`/compact`) | The session's tier, with no input cap |
+| Suggestions and away summaries | The session's tier, so the prompt cache isn't lost |
+| Session titles | `light` |
+| Auto mode's permission checks | The tier running the model Claude Code asked for, so the safety check isn't weakened |
 
 ▫️ **Key characteristics:**
-- [x] **Bounded stickiness:** after a registered skill runs, your later messages in that session stay on its tier. This ends after 10 minutes idle or 30 minutes after the skill was last invoked, whichever comes first. Claude Code's own calls, subagents and compaction never extend it
-- [x] **Deny rules:** a skill edited since it was hashed, or input over the tier's cap, gets an HTTP 400 with the reason. The request never reaches Anthropic
-- [x] **Measured:** every request is logged with its type, tier, tokens (including cache reads and writes), cost, the model that answered and the model Claude Code asked for
-- [x] **A local lab, not a production service:** one machine (macOS or Ubuntu), Docker Compose, and LiteLLM's own keys for access
+- [x] **Bounded stickiness:** after a registered skill runs, your next messages stay on its tier. This ends after 10 minutes idle, or 30 minutes after the skill was last run
+- [x] **Deny rules:** an edited skill, or input over the tier's cap, is rejected with the reason before it reaches Anthropic
+- [x] **Measured:** every request is logged with its type, tier, tokens, cost, and the model that answered
+- [x] **A local lab:** one machine (macOS or Ubuntu) with Docker Compose, not a production service
 
 ## 🔀 How It Works
 
-▫️ **One-time setup:**
-- [x] Each skill's `SKILL.md` body (without its frontmatter) is hashed with [`scripts/hash_skill.py`](scripts/hash_skill.py)
-- [x] The hash, the body's length in bytes and a tier go into [`catalog.yaml`](catalog.yaml)
-- [x] Docker Compose starts LiteLLM and Postgres. LiteLLM loads `litellm/config.yaml`: one model per tier, its prices, and the routing callback
-- [x] A budget-capped virtual key is created through LiteLLM. Claude Code uses that key and never sees the real Anthropic key
+▫️ **Setup:**
+- [x] Each skill's `SKILL.md` is hashed and listed in [`catalog.yaml`](catalog.yaml) with a tier
+- [x] Docker Compose starts LiteLLM and Postgres, with llm-trunk's routing callback loaded
+- [x] Claude Code gets a budget-capped LiteLLM key, never the real Anthropic key
 
-▫️ **Every request:** the callback decides what the request is, checking in this order:
-1. **permission check:** Claude Code's security-monitor system prompt, with no tools. Checked first, so a check made for a subagent isn't moved down a tier with it
-2. **subagent:** the request carries Claude Code's `x-claude-code-agent-id` header
-3. **compaction:** the newest user message ends with Claude Code's compaction instruction. Checked before skills, because compaction resends the message it compacts, which may be a skill call
-4. **background:** session titles, suggestions and recaps, recognized by the fixed text Claude Code sends
-5. **skill:** a skill invoked in the **newest user message** (a typed `/skill`, or Claude calling its `Skill` tool). Older messages don't count, since Claude Code resends the whole conversation every time. It's registered if it's in the catalog, its hash matches, and the key is allowed to use it. Built-in commands like `/model` aren't skills
-6. **normal:** everything else
+▫️ **Every request:**
+1. The callback works out what the request is: a permission check, a subagent, compaction, a background call, a skill, or a normal message
+2. A skill counts as registered only if it's in the catalog, its hash matches, and the key is allowed to use it
+3. The request is allowed or denied. If allowed, its model, effort and output limit are set to the tier's, whatever Claude Code asked for
+4. After Anthropic answers, one line is written to the gateway's log
 
-▫️ **Then:**
-- [x] **Allow:** the model and effort are set to the tier's, whatever Claude Code asked for, and `max_tokens` is capped at the tier's max output. Exceptions: titles run without thinking, and permission checks keep Claude Code's own effort, with `max_tokens` up to 8,192. `system` messages in the middle of a conversation are moved into the user message, because Haiku 4.5 rejects them
-- [x] **Deny:** an edited skill or oversized input gets a 400 with the reason, and nothing is sent to Anthropic
-- [x] **Log:** after Anthropic answers, one JSON line goes to the gateway's log. Failed requests (e.g. a 529 overload) are logged too
+> ⚠️ **NOTE:** Background calls, compaction and permission checks are recognized by the exact text Claude Code sends. If a Claude Code update rewords that text, they'll be routed as normal messages. After updating Claude Code, run the [manual sanity suite](tests/sanity/manual.py).
 
-> ⚠️ **NOTE:** Background, compaction and permission-check requests are recognized by the exact text Claude Code sends. If a Claude Code update rewords that text, those requests will be treated as normal messages: they'll go to the session's tier and keep its sticky timer alive. Compaction would also be subject to the input cap again. The automated tests won't catch this (they use saved copies of the text), and neither will `scripts/check_rules.py` (it trusts the logged request type). After updating Claude Code, run the [manual sanity suite](tests/sanity/manual.py) and check that the 🔒, 🧹 and `(i)` labels still appear.
-
-▫️ **Who can reach which tier (keys):**
-- [x] **A skill's hash isn't a secret.** Anyone can read the skill files, so any client can send a registered skill's exact text and get its tier. To limit this, set `allowed_skills` in a key's metadata: only those skills can lift that key above the lowest tier, and any other skill counts as unregistered (like per-port VLAN filtering). A key without `allowed_skills` can reach every tier
-- [x] **Headers are ignored by default.** The `x-skill-id` and `x-skill-hash` headers are only trusted from a key with `metadata: {"trust_skill_headers": true}`. No key has this today
-- [x] **Permission checks stay within the key's reach.** A faked one never goes above the highest tier the key could reach with a skill, and it keeps that tier's input cap. It does keep Claude Code's own effort and up to 8,192 output tokens, because real permission checks need them
+▫️ **Access per key:**
+- [x] A skill's hash isn't a secret: anyone who can read the skill files can send a registered skill and get its tier
+- [x] To limit that, set `allowed_skills` in a key's metadata. Other skills then count as unregistered for that key. A key without it can reach every tier
+- [x] Permission checks never go above the highest tier the key can reach
 
 ## 🧪 Example Session
 
-▫️ What the gateway decides during a Claude Code session in a client repo that has the catalog's skills. Each row is also an automated test in [`tests/test_example_session.py`](tests/test_example_session.py).
-
 | # | What you do | Gateway decision |
 |---|---|---|
-| 1 | Ask a plain question in a new session | normal → `light` (Haiku 4.5, low) |
-| 2 | Run `/design-review` | hash verified → `complex` (Opus 5.5, high), sticky |
-| 3 | Ask a follow-up | normal → stays on `complex` |
-| 4 | Run `/change-review` | hash verified → switches to `moderate` (Sonnet 5, medium) |
-| 5 | Ask Claude to use a subagent | subagent → `light`, one tier below `moderate` |
-| 6 | Run `/personal-notes` (not in the catalog) | unregistered → `light`, and the next message stays there |
-| 7 | Run `/compact` in a `complex` session that's over the cap | compaction → stays on `complex`, no cap |
-| 8 | Edit a skill file, then run the skill | **400** stale hash, never reaches Anthropic |
-| 9 | Paste a ~200 KB log into a `light` session | **400** input over the 64k cap, never reaches Anthropic |
-| 10 | Start a new session | starts on `light`; nothing carries over |
+| 1 | Ask a plain question in a new session | `light` (Haiku 4.5, low) |
+| 2 | Run `/design-review` | `complex` (Opus 5.5, high), sticky |
+| 3 | Ask a follow-up | stays on `complex` |
+| 4 | Run `/change-review` | switches to `moderate` (Sonnet 5, medium) |
+| 5 | Ask Claude to use a subagent | `light`, one tier below `moderate` |
+| 6 | Run `/personal-notes` (not in the catalog) | `light`, and the next message stays there |
+| 7 | Run `/compact` in a `complex` session over the cap | stays on `complex`, no cap |
+| 8 | Edit a skill file, then run the skill | **denied**: the skill changed since it was hashed |
+| 9 | Paste a ~200 KB log into a `light` session | **denied**: input over the 64k cap |
+| 10 | Start a new session | back to `light` |
 
-> ⚠️ **NOTE:** Moving to a tier with a different model or effort makes the next message uncached, because Anthropic's prompt cache is per model and settings (see [Concepts 101](#-concepts-101)). Subagents are the cheapest place to use a lower tier, since they start with a fresh context anyway.
+A denial shows up in Claude Code as, for example: `API Error: 400 llm-trunk: ~89409 input tokens exceeds the light tier cap (64000) — run /compact or start a new session`.
 
-> ⚠️ **NOTE:** Claude Code shows a denial's reason as-is, e.g. `API Error: 400 llm-trunk: ~89409 input tokens exceeds the light tier cap (64000) — run /compact or start a new session`.
+> ⚠️ **NOTE:** Changing to a tier with a different model or effort makes the next message uncached (see [Concepts 101](#-concepts-101)). Subagents are the cheapest place to use a lower tier, since they start with a fresh context.
 
 ## 🚀 Installation & Usage
 
@@ -141,18 +131,16 @@ llm-trunk runs as a local proxy on `127.0.0.1:4000`, between Claude Code and Ant
 | [Claude Code](https://docs.claude.com/en/docs/claude-code/setup) | ✓ | ✓ |
 | An Anthropic API key | ✓ | ✓ |
 
-The monitoring scripts read the gateway's log with `docker compose logs`, so run them as a user who can use Docker without `sudo`, on the machine running the gateway.
-
 ▫️ **Step 1 - Clone and configure:**
 ```
 git clone https://github.com/pdudotdev/llm-trunk
 cd llm-trunk
 cp .env.example .env
 ```
-Edit `.env` and fill in:
-- `LITELLM_MASTER_KEY`: the gateway's admin key. It must start with `sk-`, e.g. the output of `echo "sk-$(openssl rand -hex 24)"`
-- `ANTHROPIC_API_KEY`: the key the gateway uses to call Anthropic. A separate Anthropic workspace for it makes its spend easy to track
-- `POSTGRES_PASSWORD`: use `openssl rand -hex 24`. It must be URL-safe, so don't use `-base64`. `POSTGRES_USER` and `POSTGRES_DB` can stay `litellm`
+Fill in `.env`:
+- `LITELLM_MASTER_KEY`: must start with `sk-`, e.g. `echo "sk-$(openssl rand -hex 24)"`
+- `ANTHROPIC_API_KEY`: the key the gateway uses to call Anthropic
+- `POSTGRES_PASSWORD`: `openssl rand -hex 24`
 
 ▫️ **Step 2 - Install the Python tools:**
 ```
@@ -160,139 +148,107 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
-This installs what the dashboard, scripts and tests need. Run `source .venv/bin/activate` again in each new terminal.
+Run `source .venv/bin/activate` again in each new terminal.
 
 ▫️ **Step 3 - Start the gateway:**
 ```
 docker compose up -d
-curl http://127.0.0.1:4000/health/liveliness    # prints "I'm alive!" once it's up
+curl http://127.0.0.1:4000/health/liveliness    # "I'm alive!"
 ```
-If it doesn't come up, check `docker compose logs litellm`.
 
 ▫️ **Step 4 - Register your skills:**
 ```
 python3 scripts/hash_skill.py path/to/.claude/skills/my-skill/SKILL.md
 ```
-It prints the skill's `sha256` and `bytes`. Add them to `catalog.yaml` under `skills`, with a tier:
+Add the printed values to `catalog.yaml` under `skills`, with a tier:
 ```yaml
   my-skill:
     tier: moderate
     sha256: "…"
     bytes: 424
 ```
-Skills you don't register still work; they run on the lowest tier. Rerun `hash_skill.py` and update the entry whenever a `SKILL.md` changes, or that skill will be denied.
+Re-hash a skill whenever you edit its `SKILL.md`, or it will be denied. Skills you don't register still work, on the lowest tier.
 
-▫️ **Step 5 - Create a key and point Claude Code at the gateway:**
+▫️ **Step 5 - Point Claude Code at the gateway:**
 ```
 ./scripts/create_usage_key.sh
 cp client-settings.json.example path/to/your-client-repo/.claude/settings.json
 ```
-The script prints JSON with a `key` field (`sk-…`). Put that value in place of `ANTHROPIC_AUTH_TOKEN`'s placeholder in the copied `settings.json`. The key has a $50 budget per 30 days; edit the script to change that.
+The script prints a `key` (`sk-…`, $50 budget per 30 days). Put it in the copied `settings.json` as `ANTHROPIC_AUTH_TOKEN`.
 
 ▫️ **Step 6 - Use it:**
 ```
-cd path/to/your-client-repo && claude       # terminal 1: work as usual; /my-skill runs on its tier
-python3 scripts/dashboard.py                # terminal 2, in llm-trunk: live costs and routing
+cd path/to/your-client-repo && claude       # terminal 1: work as usual
+python3 scripts/dashboard.py                # terminal 2, in llm-trunk: live costs
 ```
 
-> ⚠️ **NOTE:** `catalog.yaml` is re-read on every request, so changes apply immediately. A mistake in it breaks every request; `python3 -m pytest` validates it. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
+> ⚠️ **NOTE:** Changes to `catalog.yaml` apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
 
-> ⚠️ **NOTE:** The routing history is the gateway container's log. `docker compose restart` keeps it, but `docker compose down` or recreating the container (e.g. after changing `docker-compose.yml`) clears it.
+> ⚠️ **NOTE:** The routing history is kept in the gateway container's log. `docker compose down` erases it.
 
 ## 📊 Measuring It
 
-Run these on the gateway's machine, from the `llm-trunk` folder, with the virtual environment active.
+Run these in the `llm-trunk` folder on the gateway's machine.
 
-▫️ **Live dashboard:** `python3 scripts/dashboard.py`. Shows savings compared with the models Claude Code asked for, spend per request type, a prompt-cache countdown per session (with the price of the next message while the cache is warm vs cold), and a live feed. Options: `--since` (history to load, default 1h), `--ttl` (cache lifetime, `5m` or `60m`), `--window` (how recent a session must be to show).
+| Command | What it does |
+|---|---|
+| `python3 scripts/dashboard.py` | Live dashboard: savings, spend per request type, prompt-cache countdown per session, live feed |
+| `python3 scripts/watch.py` | Live log, one line per request |
+| `python3 scripts/report.py --since 24h` | Cost totals per request type, tier, day and session |
+| `python3 scripts/check_rules.py --since 1h` | Checks every logged request against the routing rules; exits with 1 on a violation |
+| `python3 scenarios/run.py --quick` | Drives a scripted Claude Code session through the gateway and checks each step's tier and answer (about $1–2 per run) |
+| `python3 -m pytest` | Automated tests, also run by CI |
+| `python3 tests/sanity/manual.py` | Prints 10 manual checks to run in Claude Code with the dashboard open |
 
-▫️ **Live log:** `python3 scripts/watch.py`. One line per routing decision, from the last 10 minutes onward (`--since 1h` for more). Needs only the Python standard library; `NO_COLOR=1` turns off colors.
-
-▫️ **Scripted scenario:** `python3 scenarios/run.py` drives a real Claude Code session through the gateway, following [`scenarios/dev-day.yaml`](scenarios/dev-day.yaml): every request type on every tier, plus an idle gap long enough for the cache to expire. For each step it confirms the message reached Claude Code, checks the answer and the tier, then runs the rule checker over the session. It costs real tokens, about $1–2 per run on the gateway's key.
-- It runs in a client repo that has the catalog's skills and a `settings.json` pointing at the gateway. The default is `../company-client`; set another with `--client path/to/repo`
-- `--quick` skips the idle gap. `--cold-start` first waits for the cache to expire, so runs are comparable. `--dry-run` lists the steps without sending anything
-- If Claude Code stops accepting input, the run prints Claude Code's screen and stops. Results are saved in `scenarios/results/`
-
-▫️ **Rule checker:** `python3 scripts/check_rules.py` (`--since 1h` to limit it, or `--results scenarios/results/<run>.json` to check a saved scenario run). Checks every logged request against the routing rules, including that the model that answered is the tier's model. Exits with 1 if any rule was broken. It only sees what the gateway logs: a request LiteLLM rejects before the routing callback runs (e.g. a bad or missing key) isn't logged.
-
-▫️ **Cost report:** `python3 scripts/report.py` (`--since 24h` to limit it). Totals per request type, tier, day and session, and how close the gateway's input-size estimates were.
-
-▫️ **Automated tests:** `python3 -m pytest`, also run by CI on every push. The tests that compare `catalog.yaml` with the real skill files are skipped unless those files are at `../company-client/.claude/skills` or at the path in `LLM_TRUNK_SKILLS_DIR`.
-
-▫️ **Manual sanity suite:** [`tests/sanity/manual.py`](tests/sanity/manual.py) lists 10 checks to run by hand in Claude Code with the dashboard open: tiers, stickiness and its expiry, subagents, unregistered and edited skills, the input cap, compaction and permission checks. Each has pass criteria and the reason for them. `python3 tests/sanity/manual.py` prints it.
+The scripted session needs a client repo with the catalog's skills, set with `--client` (default `../company-client`).
 
 ## 💡 Concepts 101
 
-▫️ **Prompt caching (the `(c)` tag in the watcher)**
+▫️ **Prompt caching (the `(c)` tag)**
 
-Anthropic caches the beginning of each request. Claude Code marks the tool definitions, the system prompt and the conversation so far as cacheable. A later request reuses the cache for the **longest part that starts identically**. A conversation only grows **at the end**, so each request starts with exactly what the previous one sent:
+Anthropic caches the start of each request. A conversation only grows at the end, so each new message reuses everything before it from the cache and pays full price only for the new part:
 
-| Request | Contents | From cache | Processed fresh |
+| Request | Contents | From cache | New |
 |---|---|---|---|
-| Turn 1 | tools + system + **msg 1** | nothing (first time) | everything, and it's stored |
-| Turn 2 | tools + system + msg 1 + reply 1 + **msg 2** | everything up to msg 1 | reply 1 + msg 2, also stored |
-| Turn 3 | … + msg 2 + reply 2 + **msg 3** | everything up to msg 2 | reply 2 + msg 3 |
+| Turn 1 | tools + system + **msg 1** | nothing | everything |
+| Turn 2 | … + msg 1 + reply 1 + **msg 2** | up to msg 1 | reply 1 + msg 2 |
+| Turn 3 | … + msg 2 + reply 2 + **msg 3** | up to msg 2 | reply 2 + msg 3 |
 
-So each turn pays full price only for the new part at the end. In a real session, one turn had 55,427 input tokens, of which 55,173 came from the cache. Only 254 were new, so it cost $0.012 instead of about $0.14.
+- **Price:** a cache read costs 0.1× the normal input price (0.05× on Opus 5.5); a cache write costs 1.25×
+- **Expiry:** about 5 minutes without use
+- **Reset by:** changing the model or the effort settings, or rewriting earlier history (e.g. `/compact`). That's why changing tiers costs one uncached message
 
-- **Price:** reading from the cache costs **0.1×** the normal input price (0.05× on Opus 5.5). Writing to it costs **1.25×**. That makes a cached token cost the same on Opus 5.5 and Sonnet 5 ($0.20 per million), so moving heavily cached traffic between them saves little. The difference is in new input, cache writes and output
-- **Expiry:** about 5 minutes without use; each use resets it. This is separate from llm-trunk's 10-minute sticky timer
-- **What resets it** (the next message pays full price once): any change to an earlier part of the request (e.g. `/compact` rewriting the history), a different model (each model has its own cache), or different thinking or effort settings. That's why changing tiers costs one uncached message
-- **Shared across sessions:** Claude Code's tools and system prompt are the same in every session, so a session started within about 5 minutes of another reads them from the cache
+▫️ **Claude Code's own requests (the `(i)` tag)**
 
-▫️ **Claude Code's own requests (the `(i)` tag in the watcher)**
+| Request | When it's sent | Tier |
+|---|---|---|
+| **Session title** | Once, after your first messages | `light` |
+| **Next-prompt suggestion** | A few seconds after a reply | the session's |
+| **Away summary** | About 3 minutes after you leave the terminal | the session's |
+| **Permission check** | Before actions, in auto mode | the one running the model asked for |
 
-Besides your messages, Claude Code sends requests of its own. llm-trunk recognizes these (identified from live traffic):
-
-| Request | When it's sent | How it's recognized | Tier |
-|---|---|---|---|
-| **Session title** | Once per session, after your first messages | No tools, and Claude Code's `<session>` title prompt | `light` |
-| **Next-prompt suggestion** | A few seconds after a reply | Last message starts with `[SUGGESTION MODE:` | the session's |
-| **Away summary** | About 3 minutes after you leave the terminal | Last message starts with *"The user stepped away and is coming back."* | the session's |
-| **Permission check** | Before actions, in auto mode | Claude Code's security-monitor system prompt, no tools | the one running the model asked for |
-
-None of these start or extend a sticky timer; otherwise they would keep an expensive tier alive while nobody is working. Away summaries can be turned off in Claude Code's `/config`.
+None of these extend the sticky timer, so they can't keep an expensive tier alive while nobody is working.
 
 ## 📂 Project Files
 
-▫️ **Setup:**
-
 | File | Role |
 |---|---|
-| [`scripts/hash_skill.py`](scripts/hash_skill.py) | Prints the `sha256` and `bytes` of a skill's body (without frontmatter) for `catalog.yaml`. Rejects skills that use `$ARGUMENTS`, `$1`, `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}` or `` !`cmd` ``: Claude Code fills those in when it runs the skill, so the hash could never match. |
-| [`catalog.yaml`](catalog.yaml) | The routing table: the tier `order` (cheapest first), each tier's effort and token caps, and the registered skills with their hash and tier. |
-| [`litellm/config.yaml`](litellm/config.yaml) | LiteLLM's config: one entry per tier (its model and prices), the routing callback, and the master key and database settings. |
-| [`pricing.yaml`](pricing.yaml) | Anthropic's list prices per model, used to work out what a request would have cost on the model Claude Code asked for. |
-| [`docker-compose.yml`](docker-compose.yml) | Starts `postgres` (keys and spend) and `litellm` (the proxy), both reachable only from this machine. LiteLLM is pinned to one exact version (1.102.0), because the callback depends on its internals. |
-| [`scripts/create_usage_key.sh`](scripts/create_usage_key.sh) | Creates a virtual key named `llm-trunk-usage` with a budget and rate limits. It deliberately has no model restriction: LiteLLM would check that against the model Claude Code asks for, before the callback changes it, and block every request. Limit skills with `allowed_skills` in the key's metadata instead. |
-| [`client-settings.json.example`](client-settings.json.example) | Template for your client repo's `.claude/settings.json`, pointing Claude Code at the gateway. |
-| [`.env.example`](.env.example) | Template for `.env`: the master key, the Anthropic key and the Postgres settings. |
-
-▫️ **Every request:**
-
-| File | Role |
-|---|---|
-| [`policy/litellm_callback.py`](policy/litellm_callback.py) | The LiteLLM callback that runs on every request. It works out the request type (see [How It Works](#-how-it-works)) and checks a skill's hash over exactly the catalog's `bytes`, so any edit, including an added line, is denied until the skill is re-hashed. It applies the key's `allowed_skills`, estimates the input size, gets a decision from `decide()` (or picks the permission check's tier), then sets the model, effort and `max_tokens`. It remembers each session's sticky tier and each subagent's tier, and logs every outcome as one JSON line: `spend`, `deny`, `expired` or `failed`. |
-| [`policy/decide.py`](policy/decide.py) | The routing rules as one function, with no LiteLLM or network code: catalog, request type, session tier, skill and input size in; allow or deny, with tier, effort and reason, out. |
-| [`policy/hash.py`](policy/hash.py) | Hashing and frontmatter stripping, done the same way Claude Code does it (handles a byte-order mark and Windows line endings). Shared by the callback and `hash_skill.py`. |
-| [`policy/models.py`](policy/models.py) | `model_key()`: turns any spelling of a Claude model id (dated, `[1m]`, Bedrock-style) into one name, so the callback and the scripts compare models the same way. |
-
-▫️ **Monitoring and testing:**
-
-| File | Role |
-|---|---|
-| [`scripts/dashboard.py`](scripts/dashboard.py) | Live dashboard: savings, spend per request type, cache countdowns per session, live feed. |
-| [`scripts/watch.py`](scripts/watch.py) | Live log, one color-coded line per request: type, tier, skill, model, effort, sticky time left, input tokens (`(c)` when mostly cached) and cost. |
-| [`scripts/report.py`](scripts/report.py) | Cost totals per request type, tier, day and session, plus estimate accuracy. |
-| [`scripts/check_rules.py`](scripts/check_rules.py) | Checks logged requests against the routing rules; exits with 1 on a violation. |
-| [`scenarios/run.py`](scenarios/run.py) · [`scenarios/dev-day.yaml`](scenarios/dev-day.yaml) | The scripted Claude Code session and its steps. |
-| [`tests/`](tests/) | Automated tests for the routing rules, the callback (with LiteLLM stubbed out), the catalog, the log format and every script. [`tests/sanity/manual.py`](tests/sanity/manual.py) is the manual suite; pytest doesn't run it. |
+| [`catalog.yaml`](catalog.yaml) | Tiers and registered skills |
+| [`litellm/config.yaml`](litellm/config.yaml) | The model and prices for each tier |
+| [`pricing.yaml`](pricing.yaml) | Anthropic's list prices, for the "without llm-trunk" comparison |
+| [`docker-compose.yml`](docker-compose.yml) | LiteLLM and Postgres, reachable only from this machine |
+| [`.env.example`](.env.example) · [`client-settings.json.example`](client-settings.json.example) | Templates for `.env` and your client repo's `.claude/settings.json` |
+| [`policy/`](policy/) | The routing callback and rules |
+| [`scripts/`](scripts/) | Key creation, skill hashing, dashboard, live log, report, rule checker |
+| [`scenarios/`](scenarios/) | The scripted Claude Code session |
+| [`tests/`](tests/) | Automated tests, plus the manual sanity suite in `tests/sanity/` |
 
 ## ⬆️ Planned Upgrades
 - [ ] Benchmark table: the same scenario with and without routing, repeated, from a cold cache
 - [ ] Per-agent exceptions for subagents (e.g. a planning agent keeping its parent's tier)
 - [ ] Cache-aware switching: only move to a cheaper tier when the savings outweigh re-caching
 - [ ] Per-department virtual keys, each limited with `allowed_skills`, with spend shown per key
-- [ ] Log requests LiteLLM rejects before the routing callback runs, so the rule checker sees them too
+- [ ] Log requests LiteLLM rejects before the routing callback runs
 
 ## 📄 Disclaimer
 You're responsible for creating your own API keys, paying for your usage, and checking `catalog.yaml` against your own skill files before routing real work through llm-trunk.
