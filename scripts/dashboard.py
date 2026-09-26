@@ -330,10 +330,10 @@ def _clock(seconds: int) -> str:
 
 def sessions_panel(dash: Dashboard) -> Panel:
     table = Table(box=None, padding=(0, 1), show_edge=False, header_style="dim")
-    for name in ("SESSION", "MODEL", "CACHE", "NEXT MESSAGE"):
+    for name in ("SESSION", "MODEL", "CACHE", "STICKY"):
         table.add_column(name, no_wrap=True, overflow="ellipsis")
     # The one column that gives way on a narrow terminal (its text still won't wrap).
-    table.add_column("STICKY", no_wrap=False)
+    table.add_column(Text("NEXT MESSAGE", no_wrap=True, overflow="ellipsis"), no_wrap=False)
     now = dash.clock()
     active = [(session, state) for session, state in dash.sessions.items() if now - state["last"] <= dash.window]
     recent = sorted(active, key=lambda item: -item[1]["last"])[:SESSION_ROWS]
@@ -341,15 +341,15 @@ def sessions_panel(dash: Dashboard) -> Panel:
         warm, left, if_warm, if_cold = dash.cache_state(state)
         status = Text(f"● {_clock(left)}", style="green") if warm else Text("○ cold", style="bold red")
         if if_warm is None or if_cold is None:
-            next_message = Text("")
+            next_message = Text("", no_wrap=True, overflow="ellipsis")
         elif warm:
-            next_message = Text(f"{_money(if_warm)} · cold {_money(if_cold)}", style="dim")
+            next_message = Text(f"{_money(if_warm)} now · {_money(if_cold)} when cold", style="dim", no_wrap=True, overflow="ellipsis")
         else:
-            next_message = Text(f"next re-cache costs {_money(if_cold)}", style="red")
+            next_message = Text(f"next re-cache costs {_money(if_cold)}", style="red", no_wrap=True, overflow="ellipsis")
         sticky = dash.sticky_left(session)
         sticky_text = Text(f"{ICONS['sticky']} {_clock(sticky[1])} {sticky[0]}" if sticky else "—",
-                           style="yellow" if sticky else "dim", no_wrap=True, overflow="ellipsis")
-        table.add_row(_session_text(session), _model_text(state["model"]), status, next_message, sticky_text)
+                           style="yellow" if sticky else "dim")
+        table.add_row(_session_text(session), _model_text(state["model"]), status, sticky_text, next_message)
     if not recent:
         table.add_row(Text(f"no activity in the last {_duration(dash.window)}", style="dim"))
     title = f"sessions active in the last {_duration(dash.window)} · cache {_duration(dash.ttl)}"
@@ -363,7 +363,8 @@ GAP = "  "
 
 
 def feed_row(dash: Dashboard, when: datetime, kind: str, event: dict, saving: float | None) -> tuple[list, Text | None]:
-    """(the row's leading cells, the detail that runs on to the end of the line)."""
+    """(a cell for every column, the NOTE that runs on to the end of the line)."""
+    na = Text("—", style="dim")
     lead = [Text(f"{when:%H:%M:%S}", style="dim"), _session_text(event.get("session"))]
     if kind == "spend":
         route = route_kind(event)
@@ -372,44 +373,50 @@ def feed_row(dash: Dashboard, when: datetime, kind: str, event: dict, saving: fl
         tokens = event.get("input_tokens")
         size = fmt_tokens(tokens) + (" (c)" if tokens and cached * 2 >= tokens else "")
         cost = event.get("cost")
-        effort = event.get("effort")
         return [
             *lead, Text(label, style="bold" if route == "invoked" else ""),
-            type_text(event), event.get("tier") or Text("—", style="dim"),
-            _model_text(served_model(event, dash.routes, dash.prices)), effort or Text("—", style="dim"),
-            size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
+            type_text(event), event.get("tier") or na,
+            _model_text(served_model(event, dash.routes, dash.prices)), event.get("effort") or na,
+            size, _money(cost) if isinstance(cost, (int, float)) else na, vs_asked(saving),
         ], None
     if kind == "deny":
+        # Refused before reaching Anthropic: no tier, model or cost.
         reason = str(event.get("reason", "")).removeprefix("llm-trunk: ")
-        return [*lead, Text(f"{ICONS['denied']} denied", style="red"), type_text(event)], Text(reason, style="red")
+        cells = [*lead, Text(f"{ICONS['denied']} denied", style="red"), type_text(event), *[na] * 6]
+        return cells, Text(reason, style="red")
     if kind == "failed":
         error = " ".join(str(event.get("error") or "").split())
-        detail = f"upstream {event.get('status') or 'error'}" + (f": {error}" if error else "")
-        cells = [*lead, Text(f"{ICONS['failed']} failed", style="red"), type_text(event), event.get("tier") or ""]
-        return cells, Text(detail, style="red")
-    detail = f"{event.get('skill_id')} ({event.get('why')}) → back to untagged"
-    return [*lead, Text(f"{ICONS['expired']} expired", style="yellow"), "", event.get("tier") or ""], Text(detail, style="yellow")
+        note = f"upstream {event.get('status') or 'error'}" + (f": {error}" if error else "")
+        cells = [*lead, Text(f"{ICONS['failed']} failed", style="red"), type_text(event), event.get("tier") or na,
+                 _model_text(served_model(event, dash.routes, dash.prices)), event.get("effort") or na, *[na] * 3]
+        return cells, Text(note, style="red")
+    # Not a request: the session's sticky route timed out. It is logged just
+    # before the request that noticed, which is the row above it.
+    note = f"{event.get('skill_id')} sticky route ended ({event.get('why')}) → back to untagged"
+    cells = [*lead, Text(f"{ICONS['expired']} expired", style="yellow"), na, event.get("tier") or na, *[na] * 5]
+    return cells, Text(note, style="yellow")
 
 
 def feed_lines(rows: list[tuple[list, Text | None]]) -> list[Text]:
-    """Lay the rows out in columns sized to what's shown. A row's detail starts
-    after its last cell and runs on; the panel cuts off whatever doesn't fit."""
-    rows = [([cell if isinstance(cell, Text) else Text(cell) for cell in cells], detail) for cells, detail in rows]
+    """Lay the rows out in columns sized to what's shown. A row's NOTE comes
+    after the last column and runs on; the panel cuts off whatever doesn't fit."""
+    rows = [([cell if isinstance(cell, Text) else Text(cell) for cell in cells], note) for cells, note in rows]
     widths = [len(name) for name, _ in FEED_COLUMNS]
     for cells, _ in rows:
         for i, cell in enumerate(cells):
             widths[i] = max(widths[i], cell.cell_len)
-    header = [(Text(name, style="dim"), right) for name, right in FEED_COLUMNS]
+    header = [Text(name, style="dim") for name, _ in FEED_COLUMNS]
+    has_notes = any(note for _, note in rows)
     lines = []
-    for cells, detail in [([cell for cell, _ in header], None), *rows]:
+    for cells, note in [(header, Text("NOTE", style="dim") if has_notes else None), *rows]:
         line = Text(no_wrap=True, overflow="ellipsis")
         for i, cell in enumerate(cells):
             pad = " " * (widths[i] - cell.cell_len)
             line.append_text(Text(pad) + cell if FEED_COLUMNS[i][1] else cell + Text(pad))
-            if i < len(cells) - 1 or detail:
+            if i < len(cells) - 1 or note:
                 line.append(GAP)
-        if detail:
-            line.append_text(detail)
+        if note:
+            line.append_text(note)
         line.rstrip()
         lines.append(line)
     return lines

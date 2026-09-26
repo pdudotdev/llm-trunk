@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 from conftest import REPO
+from rich.cells import cell_len
 from rich.console import Console
 
 sys.path.insert(0, str(REPO / "scripts"))
@@ -189,7 +190,7 @@ def test_warm_session_line_is_not_truncated():
     dash = _dashboard()
     dash.add(T0, "spend", _spend(alias="complex", input_tokens=53_000))
     screen = _screen(dash)
-    assert "NEXT MESSAGE" in screen and "$0.011 · cold $0.265" in screen
+    assert "NEXT MESSAGE" in screen and "$0.011 now · $0.265 when cold" in _screen(dash, width=160)
 
 
 def test_spend_pane_groups_by_request_type():
@@ -228,7 +229,7 @@ def test_cold_session_names_the_re_cache_cost():
     dash = _dashboard(clock)
     dash.add(T0, "spend", _spend(alias="complex", input_tokens=53_000))
     clock.now += 301
-    assert "next re-cache costs $0.265" in _screen(dash)
+    assert "next re-cache costs $0.265" in _screen(dash, width=160)
 
 
 def test_session_clock_follows_the_main_conversation_only():
@@ -266,10 +267,33 @@ def test_deny_reason_runs_to_the_end_of_the_line():
               "8b1e77c2a9d4) — re-run scripts/hash_skill.py and update catalog.yaml")
     dash.add(T0, "spend", _spend())
     dash.add(T0, "deny", {"code": "stale_hash", "reason": reason, "session": "s1", "request_type": "skill"})
-    assert reason.removeprefix("llm-trunk: ") in _screen(dash, width=200)
-    narrow = _screen(dash)  # cut off at the edge, without squeezing the other rows
+    assert reason.removeprefix("llm-trunk: ") in _screen(dash, width=260)
+    narrow = _screen(dash, width=160)  # cut off at the edge, without squeezing the other rows
     assert "changed since it was hashed" in narrow and "update catalog.yaml" not in narrow
     assert "40k (c)  $0.007" in narrow
+
+
+def test_every_row_fills_every_column():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(request_type="skill", skill_id="change-review", skill_hash="h", tier="moderate"))
+    dash.add(T0, "deny", {"code": "input_cap", "reason": "llm-trunk: too big", "session": "s1", "request_type": "normal"})
+    dash.add(T0, "expired", {"skill_id": "change-review", "tier": "moderate", "why": "idle", "session": "s1"})
+    feed = _screen(dash, width=200).split("─ live")[1]
+    header, expired, denied, _ = [line for line in feed.splitlines() if "NOTE" in line or "s1" in line]
+    def column(line, text):  # on screen: the emoji take two cells
+        return cell_len(line[: line.index(text)])
+
+    note = column(header, "NOTE")
+    assert column(expired, "change-review sticky route ended (idle) → back to untagged") == note
+    assert column(denied, "too big") == note
+    assert expired.split()[5:12] == ["—", "moderate", "—", "—", "—", "—", "—"]  # REQ TYPE .. VS ASKED
+    assert denied.split()[5:13] == ["normal", "—", "—", "—", "—", "—", "—", "too"]
+
+
+def test_note_column_only_when_a_row_has_one():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend())
+    assert "NOTE" not in _screen(dash)
 
 
 def _busy(clock, rows):
@@ -349,7 +373,7 @@ def test_sessions_pane_shows_the_sticky_timer():
                                  alias="complex", sticky_left_s=600))
     clock.now += 70
     assert "📌 8:50 design-review" in _screen(dash, width=160)
-    assert "📌 8:50" in _screen(dash)  # a narrow terminal shortens the skill name, never the timer
+    assert "📌 8:50 design-review" in _screen(dash)  # a narrow terminal shortens the price text first
     # A background call reports the timer without refreshing it; a subagent reports none.
     dash.add(T0, "spend", _spend(request_type="background", background="title", skill_id="design-review", sticky_left_s=600))
     dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate"))

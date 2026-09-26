@@ -143,7 +143,7 @@ def test_expired_event_is_rendered(gateway, clock, capsys):
     (line,) = _log_lines(capsys.readouterr().out)
     kind, event = _event(line)
     assert (kind, event["skill_id"], event["tier"]) == ("expired", "plan", "complex")
-    assert "plan (idle) → back to untagged" in render(line)
+    assert "plan sticky route ended (idle) → back to untagged" in render(line)
 
 
 def test_old_event_lines_still_render():
