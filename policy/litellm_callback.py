@@ -487,6 +487,9 @@ class SkillRoutingCallback(CustomLogger):
         if effective_skill_id is not None and background is None:
             self._touch_sticky(session_key, effective_skill_id, reinvoked=skill_id is not None)
 
+        # The model Claude Code asked for, before the lane replaces it: the
+        # baseline for "what would this have cost without llm-trunk".
+        requested_model = data.get("model")
         data["model"] = decision.alias
         # Claude Code sends its own `thinking` + `output_config.effort` (the
         # user's /effort), and LiteLLM lets caller-supplied values win over
@@ -523,6 +526,7 @@ class SkillRoutingCallback(CustomLogger):
             "session": _short_session(session_key),
             "sticky_expires_at": self._sticky_expires_at(session_key) if effective_skill_id else None,
             "background": background,
+            "requested_model": requested_model,
         }
         return data
 
@@ -542,6 +546,7 @@ class SkillRoutingCallback(CustomLogger):
             "session": routing.get("session"),
             "sticky_left_s": max(0, int(expires_at - time.time())) if expires_at else None,
             "background": routing.get("background"),
+            "requested_model": routing.get("requested_model"),
         }
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
@@ -558,6 +563,8 @@ class SkillRoutingCallback(CustomLogger):
                 # Reads only: a cache *write* is billed at 1.25x, the opposite
                 # of what the watcher's "(c)" tag claims.
                 "cache_read_tokens": _usage_value(usage, "cache_read_input_tokens"),
+                # Both are included in input_tokens (LiteLLM adds them in).
+                "cache_write_tokens": _usage_value(usage, "cache_creation_input_tokens"),
                 "cost": kwargs.get("response_cost"),
             },
         )
