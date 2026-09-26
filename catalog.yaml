@@ -34,10 +34,10 @@ skills:
     tier: complex
     sha256: "7d99d4ff0879e71635e77ba5e2c003376f83355d75c0d557328062b814fc0da3"
     bytes: 668
-  code-review:
+  change-review:
     tier: moderate
-    sha256: "b80501d2b2d34e05567bfcc59ef062c77e82173d05ad976a9fd279badab20aaa"
-    bytes: 521
+    sha256: "8bbc59b2aeecb4874d6304c2663d2ac159d830077e176467639a4fa41a8d043e"
+    bytes: 523
   unit-tests:
     tier: moderate
     sha256: "bc6e789851cd74981ce8c4f167ca62cb6956f3ad0032028a226acdf8d1f055c8"

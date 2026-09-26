@@ -109,7 +109,7 @@ A local proxy between Claude Code and Anthropic on `127.0.0.1:4000`. LiteLLM doe
 | 1 | Asks a plain question in a new session | normal → `light` (Haiku 4.5, low) |
 | 2 | Runs `/design-review` | hash verified → `complex` (Opus 5.5, high), sticky |
 | 3 | Asks a follow-up, no skill | normal → stays on `complex` |
-| 4 | Runs `/code-review` | hash verified → switches to `moderate` (Sonnet 5, medium) |
+| 4 | Runs `/change-review` | hash verified → switches to `moderate` (Sonnet 5, medium) |
 | 5 | Asks Claude to use a subagent | subagent → `light`, one tier below `moderate` |
 | 6 | Runs `/personal-notes` (not in the catalog) | unregistered → `light`, and the follow-up stays there |
 | 7 | Runs `/compact` in a `complex` session that's over the cap | compaction → stays on `complex`, not capped |
