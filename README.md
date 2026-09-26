@@ -192,6 +192,18 @@ python3 scripts/dashboard.py                # terminal 2, in llm-trunk: live cos
 ▫️ **Desktop Code tab:**
 The Claude Desktop app's Code tab ignores a project's `settings.json`, so it cannot be routed per-repo. Desktop Code sessions always use your default settings (subscription or machine-wide). To use the gateway with a project, use the **CLI** (`claude` command) or the **VS Code extension** instead.
 
+▫️ **Machine-wide routing (for API-only teams):**
+If your team has no Claude Code subscriptions and routes all work through the gateway, set these in `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+    "ANTHROPIC_AUTH_TOKEN": "sk-…"
+  }
+}
+```
+⚠️ **Warnings:** Every Claude Code session on this machine will use the gateway API key and bill against it. The gateway must always be running, or all sessions will fail. This setup is best for dedicated dev machines or CI environments; for mixed personal and team work, use per-repo opt-in instead.
+
 ## 📊 Measuring It
 
 Run these in the `llm-trunk` folder on the gateway's machine.
