@@ -42,7 +42,6 @@ __________▼_________________▼________________▼________________▼_________
   - [🧪 Example Session](#-example-session)
   - [🚀 Installation & Usage](#-installation--usage)
   - [⚠️ Limitations](#️-limitations)
-  - [📊 Measuring It](#-measuring-it)
   - [💡 Concepts 101](#-concepts-101)
   - [📂 Project Files](#-project-files)
   - [⬆️ Planned Upgrades](#️-planned-upgrades)
@@ -182,6 +181,7 @@ The script prints a `key` (`sk-…`, $50 budget per 30 days). Put it in the copi
 cd path/to/your-client-repo && claude       # terminal 1: work as usual
 python3 scripts/dashboard.py                # terminal 2, in llm-trunk: live costs
 ```
+The dashboard starts empty; add `--since 1h` to load recent history. Scroll the feed with ↑/↓ or the mouse wheel, `g` jumps back to the newest.
 
 > ⚠️ **NOTE:** Changes to `catalog.yaml` apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
 
@@ -203,21 +203,6 @@ If your team has no Claude Code subscriptions and routes all work through the ga
 }
 ```
 ⚠️ **Warnings:** Every Claude Code session on this machine will use the gateway API key and bill against it. The gateway must always be running, or all sessions will fail. This setup is best for dedicated dev machines or CI environments; for mixed personal and team work, use per-repo opt-in instead.
-
-## 📊 Measuring It
-
-Run these in the `llm-trunk` folder on the gateway's machine.
-
-| Command | What it does |
-|---|---|
-| `python3 scripts/dashboard.py` | Live dashboard: savings, spend per request type, prompt-cache and sticky-tier countdowns per session, and a feed with one row per request (scroll with ↑/↓ or the mouse wheel, `g` for newest). Starts empty; `--since 1h` adds history |
-| `python3 scripts/report.py --since 24h` | Cost totals per request type, tier, day and session |
-| `python3 scripts/check_rules.py --since 1h` | Checks every logged request against the routing rules; exits with 1 on a violation |
-| `python3 scenarios/run.py --quick` | Drives a scripted Claude Code session through the gateway and checks each step's tier and answer (about $1–2 per run) |
-| `python3 -m pytest` | Automated tests, also run by CI |
-| `python3 tests/sanity/manual.py` | Prints 10 manual checks to run in Claude Code with the dashboard open |
-
-The scripted session needs a client repo with the catalog's skills, set with `--client` (default `../company-client`).
 
 ## 💡 Concepts 101
 
@@ -256,16 +241,13 @@ None of these extend the sticky timer, so they can't keep an expensive tier aliv
 | [`docker-compose.yml`](docker-compose.yml) | LiteLLM and Postgres, reachable only from this machine |
 | [`.env.example`](.env.example) · [`client-settings.json.example`](client-settings.json.example) | Templates for `.env` and your client repo's `.claude/settings.json` |
 | [`policy/`](policy/) | The routing callback and rules |
-| [`scripts/`](scripts/) | Key creation, skill hashing, dashboard, live log, report, rule checker |
+| [`scripts/`](scripts/) | Key creation, skill hashing, dashboard, report, rule checker |
 | [`scenarios/`](scenarios/) | The scripted Claude Code session |
 | [`tests/`](tests/) | Automated tests, plus the manual sanity suite in `tests/sanity/` |
 
 ## ⬆️ Planned Upgrades
-- [ ] Benchmark table: the same scenario with and without routing, repeated, from a cold cache
-- [ ] Per-agent exceptions for subagents (e.g. a planning agent keeping its parent's tier)
 - [ ] Cache-aware switching: only move to a cheaper tier when the savings outweigh re-caching
 - [ ] Per-department virtual keys, each limited with `allowed_skills`, with spend shown per key
-- [ ] Log requests LiteLLM rejects before the routing callback runs
 
 ## 📄 Disclaimer
 You're responsible for creating your own API keys, paying for your usage, and checking `catalog.yaml` against your own skill files before routing real work through llm-trunk.

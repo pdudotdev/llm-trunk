@@ -277,12 +277,12 @@ def header(dash: Dashboard) -> Panel:
         share = abs(dash.saved) / dash.compared_without
         if dash.saved >= 0:
             headline = Text.assemble(
-                ("SAVED ", "bold"), (_money(dash.saved), "bold green"),
+                ("SAVED (est.) ", "bold"), (_money(dash.saved), "bold green"),
                 (f"  ·  {share:.0%} cheaper than the models Claude Code asked for", "green"),
             )
         else:
             headline = Text.assemble(
-                ("COSTING ", "bold"), (_money(-dash.saved), "bold red"),
+                ("COSTING (est.) ", "bold"), (_money(-dash.saved), "bold red"),
                 (f" MORE  ·  +{share:.0%} vs the models Claude Code asked for", "red"),
             )
         detail = Text(

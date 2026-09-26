@@ -125,7 +125,7 @@ def test_render_shows_savings_types_sessions_and_feed():
     clock.now += 120
     screen = _screen(dash)
     saved_share = dash.saved / dash.compared_without
-    assert "SAVED $0.0" in screen and f"{saved_share:.0%} cheaper than the models Claude Code asked for" in screen
+    assert "SAVED (est.) $0.0" in screen and f"{saved_share:.0%} cheaper than the models Claude Code asked for" in screen
     assert "plan" in screen and "untagged" in screen
     assert "● 3:00" in screen
     assert "invoked" in screen and "denied" in screen and "Opus 5.5" in screen and "low" in screen
@@ -153,7 +153,7 @@ def test_type_that_costs_more_than_asked_is_flagged():
     assert dash.saved < 0
     assert dash.type_saving("skill") == pytest.approx(-0.25)  # Opus 5 is 25% pricier on uncached tokens
     screen = _screen(dash)
-    assert "COSTING $" in screen and "MORE" in screen
+    assert "COSTING (est.) $" in screen and "MORE" in screen
     assert "⚠ +25% cost" in screen  # in the request-type panel and the feed
 
 
