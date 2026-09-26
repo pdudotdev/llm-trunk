@@ -11,10 +11,9 @@ import pytest
 import yaml
 from conftest import REPO
 
-from policy.cliffs import _VENDOR_CLIFFS
 from policy.hash import sha256_hex, strip_frontmatter
 
-EFFORTS = {"low", "medium", "high", "xhigh"}  # never "max" (LLM-TRUNK.md)
+EFFORTS = {"low", "medium", "high", "xhigh"}  # never "max": a tier sets a ceiling, not an unbounded budget
 CATALOG = yaml.safe_load((REPO / "catalog.yaml").read_text())
 CONFIG = yaml.safe_load((REPO / "litellm" / "config.yaml").read_text())
 PRICES = yaml.safe_load((REPO / "pricing.yaml").read_text())["models"]
@@ -38,7 +37,6 @@ def test_tier_is_complete(tier):
     assert tier in MODELS, f"tier {tier!r} has no model_name in litellm/config.yaml"
     assert MODELS[tier] in PRICES, f"{MODELS[tier]} has no price in pricing.yaml"
     assert row["effort"] in EFFORTS
-    assert row.get("vendor", "anthropic") in {"anthropic", *_VENDOR_CLIFFS}
     for cap in ("max_input", "max_output"):
         assert isinstance(row[cap], int) and row[cap] > 0
 

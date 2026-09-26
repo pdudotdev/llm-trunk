@@ -1,4 +1,5 @@
 """scripts/dashboard.py: savings math, cache clocks and rendering."""
+import argparse
 import sys
 from datetime import datetime, timezone
 
@@ -11,7 +12,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import dashboard  # noqa: E402
 
 PRICES = dashboard.load_prices()
-ROUTES = {"plan-lane": "anthropic/claude-opus-5-5", "verify-lane": "anthropic/claude-haiku-4-5", "untagged": "anthropic/claude-haiku-4-5"}
+ROUTES = {"complex": "anthropic/claude-opus-5-5", "moderate": "anthropic/claude-sonnet-5", "light": "anthropic/claude-haiku-4-5"}
 T0 = datetime(2026, 9, 26, 11, 0, 0, tzinfo=timezone.utc)
 
 
@@ -49,7 +50,7 @@ def test_without_trunk_prices_the_requested_model():
     assert baseline == pytest.approx(0.0525 * 4)  # Opus 5.5 is 4x Haiku 4.5 for every token type here
 
 
-def test_no_saving_when_the_lane_runs_the_requested_model():
+def test_no_saving_when_the_tier_runs_the_requested_model():
     event = {"input_tokens": 1000, "output_tokens": 10, "cost": 0.01, "requested_model": "claude-opus-5-5-20260101"}
     assert dashboard.without_trunk(event, "anthropic/claude-opus-5-5", PRICES) == pytest.approx(0.01)
 
@@ -60,7 +61,7 @@ def test_old_events_without_a_requested_model_are_not_compared():
 
 
 def _spend(**fields):
-    base = {"skill_id": None, "skill_hash": None, "alias": "untagged", "effort": "low", "session": "s1",
+    base = {"skill_id": None, "skill_hash": None, "alias": "light", "effort": "low", "session": "s1",
             "input_tokens": 40_000, "cache_read_tokens": 38_000, "cache_write_tokens": 0, "output_tokens": 300,
             "cost": 0.0068, "requested_model": "claude-opus-5-5", "background": None}
     return {**base, **fields}
@@ -80,14 +81,14 @@ def _dashboard(clock=None):
 def test_dashboard_totals_and_savings():
     dash = _dashboard()
     dash.add(T0, "spend", _spend())
-    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05))
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="complex", cost=0.05))
     dash.add(T0, "spend", _spend(requested_model=None, cost=0.01))  # logged before requested_model existed
     dash.add(T0, "deny", {"code": "input_cap", "reason": "too big", "session": "s1"})
     assert dash.requests == 3 and dash.compared == 2 and dash.denies == 1
     assert dash.actual == pytest.approx(0.0668)
     # The untagged request ran on Haiku instead of Opus 5.5. Mostly cached input,
     # and Opus 5.5 cache reads are only 2x Haiku's ($0.20 vs $0.10), so the
-    # ratio is well under the 4x of uncached tokens. The plan lane already runs
+    # ratio is well under the 4x of uncached tokens. The complex tier already runs
     # Opus 5.5, so it saves nothing.
     ratio = dashboard.token_cost(_spend(), PRICES["claude-opus-5-5"]) / dashboard.token_cost(_spend(), PRICES["claude-haiku-4-5"])
     assert 2 < ratio < 3
@@ -99,7 +100,7 @@ def test_dashboard_totals_and_savings():
 def test_cache_clock_warm_then_cold():
     clock = Clock()
     dash = _dashboard(clock)
-    dash.add(T0, "spend", _spend(alias="plan-lane", input_tokens=100_000))
+    dash.add(T0, "spend", _spend(alias="complex", input_tokens=100_000))
     warm, left, if_warm, if_cold = dash.cache_state(dash.sessions["s1"])
     assert warm and left == 300
     assert if_warm == pytest.approx(100_000 * 0.20 / 1e6)  # Opus 5.5 cache read
@@ -114,11 +115,11 @@ def _screen(dash) -> str:
     return console.export_text()
 
 
-def test_render_shows_savings_lanes_sessions_and_feed():
+def test_render_shows_savings_types_sessions_and_feed():
     clock = Clock()
     dash = _dashboard(clock)
     dash.add(T0, "spend", _spend())
-    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", session="s2", cost=0.05))
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="complex", session="s2", cost=0.05))
     dash.add(T0, "deny", {"code": "input_cap", "reason": "llm-trunk: ~89409 input tokens exceeds the cap", "session": "s3"})
     clock.now += 120
     screen = _screen(dash)
@@ -144,10 +145,10 @@ def test_vs_asked_labels(saving, text):
 
 
 def test_type_that_costs_more_than_asked_is_flagged():
-    # What the live run found: Claude Code asked for Opus 5.5, the plan lane ran Opus 5.
-    routes = {**ROUTES, "plan-lane": "anthropic/claude-opus-5"}
+    # What the live run found: Claude Code asked for Opus 5.5, the tier ran Opus 5.
+    routes = {**ROUTES, "complex": "anthropic/claude-opus-5"}
     dash = dashboard.Dashboard(PRICES, routes, 300, Clock())
-    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05, cache_read_tokens=0))
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="complex", cost=0.05, cache_read_tokens=0))
     assert dash.saved < 0
     assert dash.type_saving("skill") == pytest.approx(-0.25)  # Opus 5 is 25% pricier on uncached tokens
     screen = _screen(dash)
@@ -155,19 +156,19 @@ def test_type_that_costs_more_than_asked_is_flagged():
     assert "⚠ +25% cost" in screen  # in the request-type panel and the feed
 
 
-def test_logged_model_wins_over_current_lane_config():
-    # History stays true after a lane is re-pointed: this request really ran on Opus 5.
-    dash = _dashboard()  # ROUTES now point plan-lane at Opus 5.5
-    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05,
+def test_logged_model_wins_over_current_tier_config():
+    # History stays true after a tier is re-pointed: this request really ran on Opus 5.
+    dash = _dashboard()  # ROUTES now point complex at Opus 5.5
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="complex", cost=0.05,
                                  cache_read_tokens=0, model="claude-opus-5-20260101"))
     assert dash.type_saving("skill") == pytest.approx(-0.25)
     assert dash.sessions["s1"]["model"] == "claude-opus-5-20260101"
 
 
-def test_unpriceable_logged_model_falls_back_to_lane_config():
+def test_unpriceable_logged_model_falls_back_to_tier_config():
     dash = _dashboard()
-    dash.add(T0, "spend", _spend(model="qa-test-plan-creation"))  # e.g. an alias instead of a model id
-    assert dash.sessions["s1"]["model"] == ROUTES["untagged"]
+    dash.add(T0, "spend", _spend(model="complex"))  # e.g. a tier name instead of a model id
+    assert dash.sessions["s1"]["model"] == ROUTES["light"]
     assert dash.compared == 1
 
 
@@ -186,7 +187,7 @@ def test_sessions_idle_longer_than_the_window_are_hidden():
 
 def test_warm_session_line_is_not_truncated():
     dash = _dashboard()
-    dash.add(T0, "spend", _spend(alias="plan-lane", input_tokens=53_000))
+    dash.add(T0, "spend", _spend(alias="complex", input_tokens=53_000))
     screen = _screen(dash)
     assert "next $0.011 · cold $0.265" in screen
 
@@ -207,20 +208,20 @@ def test_spend_pane_groups_by_request_type():
 
 def test_feed_shows_tier_and_skill():
     dash = _dashboard()
-    dash.add(T0, "spend", _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex", alias="plan-lane"))
-    dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate", alias="untagged"))
+    dash.add(T0, "spend", _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex", alias="complex"))
+    dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate", alias="light"))
     screen = _screen(dash)
     assert "complex · design-review" in screen and "🤖 subagent" in screen
 
 
 def test_session_clock_follows_the_main_conversation_only():
     dash = _dashboard()
-    dash.add(T0, "spend", _spend(request_type="normal", alias="plan-lane", input_tokens=120_000))
-    dash.add(T0, "spend", _spend(request_type="subagent", alias="untagged", input_tokens=15_000))
+    dash.add(T0, "spend", _spend(request_type="normal", alias="complex", input_tokens=120_000))
+    dash.add(T0, "spend", _spend(request_type="subagent", alias="light", input_tokens=15_000))
     dash.add(T0, "spend", _spend(request_type="background", background="title", input_tokens=900))
     dash.add(T0, "spend", _spend(request_type="background", background="permission_check", input_tokens=2_000))
     state = dash.sessions["s1"]
-    assert state["context"] == 120_000 and state["model"] == ROUTES["plan-lane"]
+    assert state["context"] == 120_000 and state["model"] == ROUTES["complex"]
 
 
 @pytest.mark.parametrize(("text", "seconds"), [("30m", 1800), ("2h", 7200), ("5m", 300)])
@@ -230,12 +231,5 @@ def test_window_durations(text, seconds):
 
 @pytest.mark.parametrize("text", ["2d", "90", "0m", "h", "1.5h"])
 def test_window_rejects_what_it_would_misread(text):
-    with pytest.raises(Exception):
+    with pytest.raises(argparse.ArgumentTypeError, match="use minutes or hours"):
         dashboard.duration(text)
-
-
-def test_request_types_have_one_definition():
-    from policy.decide import REQUEST_TYPES
-
-    assert dashboard.REQUEST_TYPES is REQUEST_TYPES
-    assert __import__("report").REQUEST_TYPES is REQUEST_TYPES

@@ -1,11 +1,8 @@
 from dataclasses import dataclass
 
-from .cliffs import crosses_vendor_cliff
-
 UNKNOWN_SKILL = "unknown_skill"
 STALE_HASH = "stale_hash"
 INPUT_CAP = "input_cap"
-PRICE_CLIFF = "price_cliff"
 
 # What a request is. Where it goes is its tier.
 NORMAL = "normal"
@@ -93,13 +90,6 @@ def decide(
 
     row = catalog["tiers"][tier]
     # Reasons are shown to the user by Claude Code, so each says what to do.
-    vendor = row.get("vendor")
-    if crosses_vendor_cliff(vendor, estimated_input_tokens):
-        return _deny(
-            PRICE_CLIFF,
-            f"llm-trunk: ~{estimated_input_tokens} input tokens crosses the {vendor} "
-            "price cliff — run /compact or start a new session",
-        )
     # Compaction is how an oversized conversation shrinks, so it's never capped.
     if request_type != COMPACTION and estimated_input_tokens >= row["max_input"]:
         return _deny(

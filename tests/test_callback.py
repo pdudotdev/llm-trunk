@@ -124,11 +124,15 @@ def test_sticky_route_expires_at_max_age_even_while_used(gateway, clock, capsys)
     assert '"why": "max-age"' in capsys.readouterr().out
 
 
-def test_reinvoking_resets_max_age(gateway, clock):
+def test_reinvoking_while_live_resets_max_age(gateway, clock):
+    # The route must still be live when the skill runs again (turns every
+    # 500 s keep it from idling out); otherwise re-invoking just starts fresh.
     _invoke_plan(gateway)
-    clock.advance(1500)
-    _invoke_plan(gateway)
-    clock.advance(400)
+    for _ in range(3):
+        clock.advance(500)
+        _follow_up(gateway)
+    _invoke_plan(gateway)  # at 1500 s, still live
+    clock.advance(400)  # 1900 s after the first invocation, 400 s after the second
     assert _follow_up(gateway)["model"] == "complex"
 
 
@@ -492,3 +496,116 @@ def test_tier_models_are_read_once_until_the_config_changes(catalog, monkeypatch
     reads = []
     monkeypatch.setattr("builtins.open", lambda *a, **k: reads.append(a) or (_ for _ in ()).throw(AssertionError("re-read")))
     assert cb._tier_models() == first and reads == []
+
+
+
+# --- Defensive paths ------------------------------------------------------------
+
+
+def test_revoking_a_skill_drops_the_session_off_its_tier(gateway):
+    gateway.send(request(skill_turn("plan")))  # sticky on complex with an unrestricted key
+    revoked = key(allowed_skills=["review"])  # same key, access to plan since removed
+    assert gateway.send(request(skill_turn("plan"), assistant(), user("next")), revoked)["model"] == "light"
+
+
+def test_clients_without_a_session_id_are_told_apart_by_their_first_message(gateway):
+    def plain(*messages):
+        data = request(*messages, claude_code=False)
+        data["metadata"] = {}
+        return data
+
+    gateway.send(plain(skill_turn("plan")))
+    assert gateway.send(plain(skill_turn("plan"), assistant(), user("next")))["model"] == "complex"
+    assert gateway.send(plain(user("another conversation")))["model"] == "light"
+
+
+def test_subagent_memory_is_bounded(gateway, monkeypatch):
+    monkeypatch.setattr(cb, "MAX_AGENTS", 2)
+    gateway.send(request(skill_turn("plan")))
+    for agent in ("a1", "a2", "a3"):
+        gateway.send(subagent_request(agent))
+    assert set(agent for _, agent in gateway.callback._agents) == {"a2", "a3"}
+
+
+def test_log_hooks_ignore_requests_that_were_never_routed(gateway, capsys):
+    import asyncio
+    import types
+
+    kwargs = {"litellm_params": {"metadata": {}}, "response_cost": 0.01}
+    asyncio.run(gateway.callback.async_log_success_event(kwargs, types.SimpleNamespace(usage=None), None, None))
+    asyncio.run(gateway.callback.async_log_failure_event(kwargs, None, None, None))
+    assert "llm-trunk" not in capsys.readouterr().out
+
+
+
+# --- Gaps found by the mutation sweep (2026-09-26) ---------------------------
+
+
+def test_documented_limits():
+    # README: sticky for 10 minutes idle / 30 minutes since the last
+    # invocation; permission checks get at most 8,192 output tokens.
+    assert (cb.STICKY_IDLE_TIMEOUT_SECONDS, cb.STICKY_MAX_AGE_SECONDS) == (600, 1800)
+    assert cb.PERMISSION_CHECK_MAX_OUTPUT == 8192
+
+
+def test_forged_permission_check_cannot_reach_a_tier_above_the_ceiling(gateway):
+    light_only = key(allowed_skills=["verify"])
+    assert gateway.send(_forged_permission_check("claude-sonnet-5"), light_only)["model"] == "light"
+
+
+def test_key_whose_skills_are_all_unknown_is_capped_at_the_lowest_tier(gateway):
+    assert gateway.send(_forged_permission_check("claude-opus-5-5"), key(allowed_skills=["gone"]))["model"] == "light"
+
+
+def test_malformed_allowed_skills_list_fails_closed(gateway):
+    assert gateway.send(request(skill_turn("plan")), key(allowed_skills=["plan", 3]))["model"] == "light"
+
+
+def test_trusted_header_id_without_its_hash_is_not_honored(gateway):
+    data = request(user("Run it"))
+    data["litellm_metadata"]["headers"]["x-skill-id"] = "plan"
+    assert gateway.send(data, key(trust_skill_headers=True))["model"] == "light"
+
+
+def test_different_keys_never_share_a_sticky_route(gateway):
+    import types
+
+    gateway.send(request(skill_turn("plan")), types.SimpleNamespace(token="key-a", metadata={}))
+    other = gateway.send(request(skill_turn("plan"), assistant(), user("next")), types.SimpleNamespace(token="key-b", metadata={}))
+    assert other["model"] == "light"
+
+
+def test_logged_session_label_is_the_session_id_prefix(gateway):
+    # scenarios/run.py and the dashboard match sessions on these 8 characters.
+    fields = routing(gateway.send(request(user("hi"), session="2ed5f64e-01df-4c56-8ae3-e46e60834506")))
+    assert fields["session"] == "2ed5f64e"
+
+
+def test_sticky_time_left_is_logged(gateway):
+    fields = routing(gateway.send(request(skill_turn("plan"))))
+    left = fields["sticky_expires_at"] - cb.time.time()
+    assert cb.STICKY_IDLE_TIMEOUT_SECONDS - 1 <= left <= cb.STICKY_IDLE_TIMEOUT_SECONDS
+    assert routing(gateway.send(request(user("hi"), session="s2")))["sticky_expires_at"] is None
+
+
+def test_title_needs_both_no_tools_and_the_title_prompt(gateway):
+    gateway.send(request(skill_turn("plan")))
+    no_tools = gateway.send(request(skill_turn("plan"), assistant(), user("plain question"), tools=False))
+    assert routing(no_tools)["background"] is None and no_tools["model"] == "complex"
+    with_tools = gateway.send(request(skill_turn("plan"), assistant(), user("<session>quoted</session>")))
+    assert routing(with_tools)["background"] is None
+
+
+def test_compaction_needs_both_its_instruction_and_a_summary_request(gateway):
+    gateway.send(request(skill_turn("plan")))
+    summary_only = request(skill_turn("plan"), assistant(), user("Put it in a <summary> block"))
+    assert routing(gateway.send(summary_only))["request_type"] == "normal"
+    prefix_only = request(skill_turn("plan"), assistant(), user(cb.COMPACTION_PREFIX + " Just answer."))
+    assert routing(gateway.send(prefix_only))["request_type"] == "normal"
+
+
+def test_system_message_folds_into_the_turn_right_before_it(gateway):
+    data = gateway.send(request(user("first"), assistant(), user("second"), {"role": "system", "content": "ctx"}, assistant()))
+    assert [message["role"] for message in data["messages"]] == ["user", "assistant", "user", "assistant"]
+    assert data["messages"][0]["content"] == [{"type": "text", "text": "first"}]
+    assert data["messages"][2]["content"][-1] == {"type": "text", "text": "ctx"}

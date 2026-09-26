@@ -42,11 +42,11 @@ def test_summarize_totals():
     normal = summary["types"]["normal"]
     assert (normal["requests"], normal["input"], normal["cached"]) == (2, 61000, 40000)
     assert summary["types"]["background"]["requests"] == 1
-    assert summary["tiers"]["(lane) plan-lane"]["requests"] == 3
+    assert summary["tiers"]["(old lane) plan-lane"]["requests"] == 3
     assert summary["background"] == {"title": 1}
     assert summary["denies"] == {"input_cap": 1}
     assert summary["failures"] == {"529": 1}
-    assert len(summary["days"]) == 2
+    assert summary["days"]["2026-09-22"]["requests"] == 3 and summary["days"]["2026-09-23"]["requests"] == 1
     assert round(summary["sessions"]["s1"], 3) == 0.281
     # Every spend line's estimate was 10-11% above the billed input.
     assert all(0.09 < error < 0.12 for error in summary["estimate_errors"])
@@ -82,3 +82,7 @@ def test_new_lines_group_by_request_type_and_tier():
     summary = report.summarize(report.parse(lines))
     assert set(summary["types"]) == {"subagent", "compaction"}
     assert set(summary["tiers"]) == {"moderate", "complex"}
+
+
+def test_token_amounts_are_readable():
+    assert (report._tokens(1_500_000), report._tokens(40_000), report._tokens(900)) == ("1.5M", "40k", "0.9k")

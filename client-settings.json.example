@@ -1,6 +1,6 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
-    "ANTHROPIC_AUTH_TOKEN": "REPLACE_WITH_KEY_FROM_scripts/create_qa_usage_key.sh"
+    "ANTHROPIC_AUTH_TOKEN": "REPLACE_WITH_KEY_FROM_scripts/create_usage_key.sh"
   }
 }

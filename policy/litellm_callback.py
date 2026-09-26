@@ -744,7 +744,7 @@ class SkillRoutingCallback(CustomLogger):
                 # Both are included in input_tokens (LiteLLM adds them in).
                 "cache_write_tokens": _usage_value(usage, "cache_creation_input_tokens"),
                 # The model that actually answered, as the API reports it: a
-                # lane's model can change later, the log line shouldn't.
+                # tier's model can change later, the log line shouldn't.
                 "model": getattr(response_obj, "model", None),
                 "cost": kwargs.get("response_cost"),
             },

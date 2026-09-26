@@ -69,9 +69,9 @@ def make_catalog() -> dict:
         "version": 2,
         "order": ["light", "moderate", "complex"],
         "tiers": {
-            "light": {"vendor": "anthropic", "effort": "low", "max_input": LIGHT_CAP, "max_output": 4000},
-            "moderate": {"vendor": "anthropic", "effort": "medium", "max_input": 128000, "max_output": 4000},
-            "complex": {"vendor": "anthropic", "effort": "high", "max_input": 180000, "max_output": 8000},
+            "light": {"effort": "low", "max_input": LIGHT_CAP, "max_output": 4000},
+            "moderate": {"effort": "medium", "max_input": 128000, "max_output": 4000},
+            "complex": {"effort": "high", "max_input": 180000, "max_output": 8000},
         },
         "skills": {},
     }

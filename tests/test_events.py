@@ -68,7 +68,7 @@ def test_spend_event_is_rendered(gateway, capsys):
 
 
 @pytest.mark.parametrize(
-    ("build", "route", "lane"),
+    ("build", "route", "where"),
     [
         (lambda: request(skill_turn("plan"), assistant(), user("Next?")), "sticky", "complex · plan"),
         (lambda: subagent_request(), "subagent", "moderate"),
@@ -77,11 +77,11 @@ def test_spend_event_is_rendered(gateway, capsys):
         (lambda: permission_check_request(), "passthrough", "moderate · permission"),
     ],
 )
-def test_every_request_type_is_rendered(gateway, capsys, build, route, lane):
+def test_every_request_type_is_rendered(gateway, capsys, build, route, where):
     gateway.send(request(skill_turn("plan")))  # puts the session on the complex tier
     rendered = watch.render(_spend_line(gateway, capsys, gateway.send(build())), "12:00:00", MODELS)
     assert f"{watch.ICONS[route]} {route}" in rendered
-    assert lane in rendered
+    assert where in rendered
 
 
 def test_passthrough_shows_the_model_claude_code_chose(gateway, capsys):
@@ -89,9 +89,9 @@ def test_passthrough_shows_the_model_claude_code_chose(gateway, capsys):
     assert "Sonnet 5" in rendered
 
 
-def test_long_lane_is_truncated_to_the_column(gateway, capsys):
+def test_long_tier_text_is_truncated_to_the_column(gateway, capsys):
     event = {"request_type": "skill", "tier": "complex", "skill_id": "incident-postmortem", "skill_hash": "h", "alias": "complex"}
-    text = watch.lane_text(event)
+    text = watch.tier_text(event)
     assert text == "complex · incident-postmortem"
     rendered = watch.render("llm-trunk spend: " + json.dumps(event), "12:00:00", MODELS)
     _, width, _ = watch.COLUMNS[4]

@@ -8,17 +8,14 @@ order: [light, moderate, complex]
 # new model release is a one-line change there.
 tiers:
   light:
-    vendor: anthropic
     effort: low
     max_input: 64000
     max_output: 4000
   moderate:
-    vendor: anthropic
     effort: medium
     max_input: 128000
     max_output: 4000
   complex:
-    vendor: anthropic
     effort: high
     max_input: 180000
     max_output: 8000

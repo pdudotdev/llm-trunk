@@ -26,5 +26,5 @@ litellm_settings:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
-  # The virtual key (scripts/create_qa_usage_key.sh) is created at runtime
+  # The virtual key (scripts/create_usage_key.sh) is created at runtime
   # once this stack is up.

@@ -118,3 +118,29 @@ def test_unregistered_skill_is_still_judged():
     # No verified hash: a genuinely unregistered skill must still go light.
     wrong = _event(request_type="skill", unregistered_skill="mine", session_tier="moderate", tier="moderate", model="claude-sonnet-5")
     assert check_rules.check([wrong], make_catalog(), TIER_MODELS)["violations"]
+
+
+
+def _results_file(tmp_path, events):
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"events": [{"arrived": 1790000000.0, "kind": "spend", **event} for event in events]}))
+    return path
+
+
+def _cli(*args):
+    import subprocess
+
+    return subprocess.run([sys.executable, str(REPO / "scripts" / "check_rules.py"), *args], capture_output=True, text=True)
+
+
+def test_cli_exits_zero_when_every_request_follows_the_rules(tmp_path):
+    ok = {"request_type": "normal", "tier": "light", "session_tier": "light", "session": "s1", "model": "claude-haiku-4-5"}
+    result = _cli("--results", str(_results_file(tmp_path, [ok])))
+    assert result.returncode == 0 and "1 requests checked" in result.stdout and "no rule violations" in result.stdout
+
+
+def test_cli_exits_one_and_names_the_violation(tmp_path):
+    bad = {"request_type": "normal", "tier": "complex", "session_tier": "light", "session": "s1", "model": "claude-opus-5-5"}
+    result = _cli("--results", str(_results_file(tmp_path, [bad])))
+    assert result.returncode == 1
+    assert "expected tier light, got complex" in result.stdout and "1 rule violation(s)" in result.stdout

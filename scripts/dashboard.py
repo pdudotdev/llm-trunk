@@ -11,7 +11,7 @@ Run on the machine hosting the gateway, from anywhere in the repo:
 Read-only, like scripts/watch.py, which stays the dependency-free view; this
 one needs the `rich` package. "Without llm-trunk" is an estimate: each
 request's own tokens priced at the model the client asked for (pricing.yaml),
-so a request routed to a cheaper lane shows what the lane saved. Requests
+so a request routed to a cheaper tier shows what the tier saved. Requests
 logged before the gateway recorded the requested model can't be compared and
 are counted separately.
 """
@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report import parse  # noqa: E402
 
 from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
-from watch import ICONS, REPO, STAMP_RE, fmt_tokens, lane_text, model_key, pretty_model, request_type_of, route_kind  # noqa: E402
+from watch import ICONS, REPO, STAMP_RE, fmt_tokens, tier_text, model_key, pretty_model, request_type_of, route_kind  # noqa: E402
 
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
 FEED_ROWS = 14
@@ -54,7 +54,7 @@ def load_prices(path: Path = REPO / "pricing.yaml") -> dict[str, dict]:
 
 
 def load_routes(path: Path = REPO / "litellm" / "config.yaml") -> dict[str, str]:
-    """Lane alias -> the model it really calls."""
+    """Tier -> the model it really calls."""
     config = yaml.safe_load(path.read_text())
     return {entry["model_name"]: entry["litellm_params"]["model"] for entry in config["model_list"]}
 
@@ -83,13 +83,13 @@ def without_trunk(event: dict, routed_model: str | None, prices: dict) -> float 
         return None
     actual = event.get("cost")
     # Scale LiteLLM's actual cost by the price ratio, so both sides agree
-    # when the lane runs the model the client asked for.
+    # when the tier runs the model the client asked for.
     return actual * on_requested / on_routed if isinstance(actual, (int, float)) else on_requested
 
 
 def served_model(event: dict, routes: dict, prices: dict) -> str | None:
     """The model that answered: logged per request when it's one we can price,
-    else the lane's current model from litellm/config.yaml."""
+    else the tier's current model from litellm/config.yaml."""
     logged = event.get("model")
     if logged and model_key(logged) in prices:
         return logged
@@ -192,7 +192,7 @@ def _model_text(model: str | None, effort: str | None = None) -> Text:
 
 
 def vs_asked(saving: float | None) -> Text:
-    """A request's or lane's cost vs the model Claude Code asked for."""
+    """A request's or request type's cost vs the model Claude Code asked for."""
     if saving is None or abs(saving) < 0.005:
         return Text("—", style="dim")
     if saving > 0:
@@ -286,7 +286,7 @@ def feed_panel(dash: Dashboard) -> Panel:
             cost = event.get("cost")
             table.add_row(
                 Text(clock, style="dim"), Text(label, style="bold" if route == "invoked" else ""),
-                lane_text(event),
+                tier_text(event),
                 _model_text(served_model(event, dash.routes, dash.prices), event.get("effort")),
                 size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
             )
@@ -295,7 +295,7 @@ def feed_panel(dash: Dashboard) -> Panel:
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['denied']} denied", style="red"), Text(reason[:70], style="red"))
         elif kind == "failed":
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['failed']} failed", style="red"),
-                          lane_text(event), Text(f"upstream {event.get('status') or 'error'}", style="red"))
+                          tier_text(event), Text(f"upstream {event.get('status') or 'error'}", style="red"))
         else:
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['expired']} expired", style="yellow"),
                           Text(f"{event.get('skill_id')} ({event.get('why')}) → back to untagged", style="yellow"))

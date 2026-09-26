@@ -160,7 +160,7 @@ def request_type_of(event: dict) -> str:
     return "skill" if event.get("skill_hash") else "normal"
 
 
-def lane_text(event: dict) -> str:
+def tier_text(event: dict) -> str:
     """Where the request went: the tier, plus the skill that put it there."""
     tier = event.get("tier")
     if event.get("background") == "permission_check":
@@ -177,10 +177,10 @@ def model_cells(event: dict, models: dict[str, str]) -> list[str]:
     model = models.get(alias) or pretty_model(alias)  # a passed-through request carries a model id
     text = f"{model} · {event['effort']}" if event.get("effort") else model
     _, width, _ = COLUMNS[4]
-    lane = lane_text(event)
+    where = tier_text(event)
     return [
         cell(3, text, MODEL_COLORS.get(model.split(" ")[0])),
-        cell(4, lane if len(lane) <= width else lane[: width - 1] + "…"),
+        cell(4, where if len(where) <= width else where[: width - 1] + "…"),
     ]
 
 

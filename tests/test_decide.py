@@ -7,7 +7,6 @@ from policy.decide import (
     COMPACTION,
     INPUT_CAP,
     NORMAL,
-    PRICE_CLIFF,
     SKILL,
     STALE_HASH,
     SUBAGENT,
@@ -100,19 +99,3 @@ def test_compaction_is_never_capped():
     # /compact is how an oversized conversation recovers from a cap deny.
     assert decide(make_catalog(), COMPACTION, 150_000).action == "allow"
     assert decide(make_catalog(), BACKGROUND, 150_000).code == INPUT_CAP
-
-
-def _vendor_catalog(vendor: str) -> dict:
-    catalog = make_catalog()
-    catalog["tiers"]["light"].update(vendor=vendor, max_input=1_000_000)
-    return catalog
-
-
-def test_price_cliffs():
-    # The fixtures from LLM-TRUNK.md: 210k crosses Grok/Gemini, 280k crosses OpenAI.
-    for vendor in ("grok", "gemini"):
-        assert decide(_vendor_catalog(vendor), NORMAL, 199_999).action == "allow"
-        assert decide(_vendor_catalog(vendor), NORMAL, 210_000).code == PRICE_CLIFF
-    assert decide(_vendor_catalog("openai"), NORMAL, 210_000).action == "allow"
-    assert decide(_vendor_catalog("openai"), NORMAL, 280_000).code == PRICE_CLIFF
-    assert decide(_vendor_catalog("anthropic"), NORMAL, 900_000).action == "allow"

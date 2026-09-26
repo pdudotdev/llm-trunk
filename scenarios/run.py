@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import check_rules  # noqa: E402
 import dashboard  # noqa: E402
 from report import parse  # noqa: E402
-from watch import lane_text, pretty_model  # noqa: E402
+from watch import pretty_model, tier_text  # noqa: E402
 
 GATEWAY = "http://127.0.0.1:4000"
 QUIET_SECONDS = 8  # a suggestion lands a few seconds after the reply
@@ -116,7 +116,7 @@ def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], 
         tier_ok = None if "tier" not in step else (bool(mains) and tiers == [step["tier"]])
         cost = without = 0.0
         comparable = True
-        lanes, models = [], []
+        places, models = [], []
         for event in spend:
             logged = event.get("cost")
             actual = float(logged) if isinstance(logged, (int, float)) else 0.0
@@ -126,16 +126,16 @@ def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], 
             without += baseline if baseline is not None else actual
             comparable &= baseline is not None
             if event in mains:
-                lane = lane_text(event)
+                where = tier_text(event)
                 model = pretty_model(served) if served else "?"
-                if (lane, model) not in zip(lanes, models):
-                    lanes.append(lane)
+                if (where, model) not in zip(places, models):
+                    places.append(where)
                     models.append(model)
         rows.append(
             {
                 "step": step["name"],
                 "type": step["type"],
-                "routes": [f"{lane} → {model}" for lane, model in zip(lanes, models)],
+                "routes": [f"{where} → {model}" for where, model in zip(places, models)],
                 "expected_tier": step.get("tier"),
                 "tiers": tiers,
                 "tier_ok": tier_ok,

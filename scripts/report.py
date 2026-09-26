@@ -7,7 +7,7 @@ Run on the machine hosting the gateway, from anywhere in the repo:
     python3 scripts/report.py --since 24h
 
 Read-only: it reads the same `llm-trunk` log lines as scripts/watch.py and
-totals them per lane, per day and per session. Costs are LiteLLM's estimates
+totals them per request type, tier, day and session. Costs are LiteLLM's estimates
 at the configured prices, not an invoice. Docker keeps the log only while the
 container exists, so a `docker compose up -d` that recreates it starts over.
 """
@@ -67,17 +67,17 @@ def summarize(events) -> dict:
             failures[str(event.get("status") or "error")] += 1
         if kind != "spend":
             continue
-        lane = types[request_type_of(event)]
+        row = types[request_type_of(event)]
         cost = _number(event.get("cost"))
         # Events from before tiers carry their per-skill lane as the alias.
-        tier = tiers[event.get("tier") or f"(lane) {event.get('alias') or 'untagged'}"]
+        tier = tiers[event.get("tier") or f"(old lane) {event.get('alias') or 'untagged'}"]
         tier["requests"] += 1
         tier["cost"] += cost
-        lane["requests"] += 1
-        lane["input"] += _number(event.get("input_tokens"))
-        lane["cached"] += _number(event.get("cache_read_tokens"))
-        lane["output"] += _number(event.get("output_tokens"))
-        lane["cost"] += cost
+        row["requests"] += 1
+        row["input"] += _number(event.get("input_tokens"))
+        row["cached"] += _number(event.get("cache_read_tokens"))
+        row["output"] += _number(event.get("output_tokens"))
+        row["cost"] += cost
         day = days[when.date().isoformat()]
         day["requests"] += 1
         day["cost"] += cost
