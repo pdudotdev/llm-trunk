@@ -277,14 +277,16 @@ def test_every_row_fills_every_column():
     dash = _dashboard()
     dash.add(T0, "spend", _spend(request_type="skill", skill_id="change-review", skill_hash="h", tier="moderate"))
     dash.add(T0, "deny", {"code": "input_cap", "reason": "llm-trunk: too big", "session": "s1", "request_type": "normal"})
-    dash.add(T0, "expired", {"skill_id": "change-review", "tier": "moderate", "why": "idle", "session": "s1"})
+    dash.add(T0, "expired", {"skill_id": "change-review", "tier": "moderate", "why": "idle", "session": "s1",
+                             "ended_at": T0.timestamp() - 3600})
     feed = _screen(dash, width=200).split("─ live")[1]
     header, expired, denied, _ = [line for line in feed.splitlines() if "NOTE" in line or "s1" in line]
     def column(line, text):  # on screen: the emoji take two cells
         return cell_len(line[: line.index(text)])
 
     note = column(header, "NOTE")
-    assert column(expired, "change-review sticky route ended (idle) → back to untagged") == note
+    ended = f"{datetime.fromtimestamp(T0.timestamp() - 3600, T0.tzinfo):%H:%M}"
+    assert column(expired, f"change-review sticky route ended at {ended} (idle)") == note
     assert column(denied, "too big") == note
     assert expired.split()[5:12] == ["—", "moderate", "—", "—", "—", "—", "—"]  # REQ TYPE .. VS ASKED
     assert denied.split()[5:13] == ["normal", "—", "—", "—", "—", "—", "—", "too"]

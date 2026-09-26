@@ -391,8 +391,11 @@ def feed_row(dash: Dashboard, when: datetime, kind: str, event: dict, saving: fl
                  _model_text(served_model(event, dash.routes, dash.prices)), event.get("effort") or na, *[na] * 3]
         return cells, Text(note, style="red")
     # Not a request: the session's sticky route timed out. It is logged just
-    # before the request that noticed, which is the row above it.
-    note = f"{event.get('skill_id')} sticky route ended ({event.get('why')}) → back to untagged"
+    # before the request that noticed, which is the row above it, so the row's
+    # time is when it was noticed; the note says when it really ended.
+    ended_at = event.get("ended_at")
+    ended = f" at {datetime.fromtimestamp(ended_at, when.tzinfo):%H:%M}" if isinstance(ended_at, (int, float)) else ""
+    note = f"{event.get('skill_id')} sticky route ended{ended} ({event.get('why')})"
     cells = [*lead, Text(f"{ICONS['expired']} expired", style="yellow"), na, event.get("tier") or na, *[na] * 5]
     return cells, Text(note, style="yellow")
 

@@ -10,6 +10,7 @@ from conftest import (
     REPO,
     HTTPException,
     assistant,
+    cb,
     compaction_request,
     permission_check_request,
     request,
@@ -143,7 +144,9 @@ def test_expired_event_is_rendered(gateway, clock, capsys):
     (line,) = _log_lines(capsys.readouterr().out)
     kind, event = _event(line)
     assert (kind, event["skill_id"], event["tier"]) == ("expired", "plan", "complex")
-    assert "plan sticky route ended (idle) → back to untagged" in render(line)
+    # Ended 10 idle minutes after the invocation, not when it was noticed.
+    assert event["ended_at"] == round(1_800_000_000 + 10_000 + cb.STICKY_IDLE_TIMEOUT_SECONDS)
+    assert "plan sticky route ended at " in render(line) and "(idle)" in render(line)
 
 
 def test_old_event_lines_still_render():

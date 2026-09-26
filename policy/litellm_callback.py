@@ -449,11 +449,15 @@ class SkillRoutingCallback(CustomLogger):
         if entry is None:
             return None
         deadline, why = self._sticky_deadline(entry)
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now > deadline:
             del self._sticky[session_key]
+            # Noticed only at the session's next request, which can be hours
+            # later: ended_at (wall clock) is when the route really stopped.
             _log_event(
                 "expired",
-                {"skill_id": entry[1], "tier": entry[0], "why": why, "session": _short_session(session_key)},
+                {"skill_id": entry[1], "tier": entry[0], "why": why, "session": _short_session(session_key),
+                 "ended_at": round(time.time() - (now - deadline))},
             )
             return None
         return entry[0], entry[1]
