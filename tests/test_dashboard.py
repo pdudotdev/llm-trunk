@@ -125,7 +125,7 @@ def test_render_shows_savings_lanes_sessions_and_feed():
     saved_share = dash.saved / dash.compared_without
     assert "SAVED $0.0" in screen and f"{saved_share:.0%} cheaper than the models Claude Code asked for" in screen
     assert "plan" in screen and "untagged" in screen
-    assert "warm 3:00" in screen
+    assert "● 3:00" in screen
     assert "invoked" in screen and "denied" in screen and "Opus 5.5 · low" in screen
 
 
@@ -169,3 +169,23 @@ def test_unpriceable_logged_model_falls_back_to_lane_config():
     dash.add(T0, "spend", _spend(model="qa-test-plan-creation"))  # e.g. an alias instead of a model id
     assert dash.sessions["s1"]["model"] == ROUTES["untagged"]
     assert dash.compared == 1
+
+
+def test_sessions_idle_longer_than_the_window_are_hidden():
+    clock = Clock()
+    dash = _dashboard(clock)
+    dash.add(T0, "spend", _spend(session="oldsess1"))
+    clock.now += 20 * 60
+    dash.add(datetime.fromtimestamp(clock.now, timezone.utc), "spend", _spend(session="newsess1"))
+    clock.now += 11 * 60  # oldsess1 idle 31 min, newsess1 idle 11 min (cold but still shown)
+    screen = _screen(dash)
+    assert "newsess1" in screen and "cold" in screen
+    assert "oldsess1" not in screen.split("sessions active")[1].split("live")[0]
+    assert "sessions active in the last 30 min · cache 5 min" in screen
+
+
+def test_warm_session_line_is_not_truncated():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(alias="plan-lane", input_tokens=53_000))
+    screen = _screen(dash)
+    assert "next $0.011 · cold $0.265" in screen

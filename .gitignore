@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .venv
 LLM-TRUNK.md
+# scenario runs (raw data; commit selected ones on purpose)
+scenarios/results/

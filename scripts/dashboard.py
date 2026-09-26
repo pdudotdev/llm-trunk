@@ -6,6 +6,7 @@ Run on the machine hosting the gateway, from anywhere in the repo:
     python3 scripts/dashboard.py              # last hour of history, then live
     python3 scripts/dashboard.py --since 24h
     python3 scripts/dashboard.py --ttl 60m    # prompt-cache lifetime (default 5m)
+    python3 scripts/dashboard.py --window 2h  # sessions shown if active this recently (default 30m)
 
 Read-only, like scripts/watch.py, which stays the dependency-free view; this
 one needs the `rich` package. "Without llm-trunk" is an estimate: each
@@ -107,8 +108,11 @@ def served_model(event: dict, routes: dict, prices: dict) -> str | None:
 
 
 class Dashboard:
-    def __init__(self, prices: dict, routes: dict, ttl_seconds: int, clock=time.time) -> None:
+    def __init__(self, prices: dict, routes: dict, ttl_seconds: int, clock=time.time, window_seconds: int = 1800) -> None:
         self.prices, self.routes, self.ttl, self.clock = prices, routes, ttl_seconds, clock
+        # The gateway can't see a session close, only its requests: a session
+        # counts as open while it has been active within this window.
+        self.window = window_seconds
         self.first: datetime | None = None
         self.requests = self.denies = 0
         self.actual = self.background_cost = 0.0
@@ -180,6 +184,10 @@ class Dashboard:
 # --- Rendering ---------------------------------------------------------------------
 
 
+def _duration(seconds: int) -> str:
+    return f"{seconds // 3600}h" if seconds >= 3600 and seconds % 3600 == 0 else f"{seconds // 60} min"
+
+
 def _money(value: float) -> str:
     return f"${value:,.3f}" if value < 100 else f"${value:,.0f}"
 
@@ -248,10 +256,12 @@ def sessions_panel(dash: Dashboard) -> Panel:
     table = Table.grid(padding=(0, 1))
     for _ in range(4):
         table.add_column(no_wrap=True, overflow="ellipsis")
-    recent = sorted(dash.sessions.items(), key=lambda item: -item[1]["last"])[:SESSION_ROWS]
+    now = dash.clock()
+    active = [(session, state) for session, state in dash.sessions.items() if now - state["last"] <= dash.window]
+    recent = sorted(active, key=lambda item: -item[1]["last"])[:SESSION_ROWS]
     for session, state in recent:
         warm, left, if_warm, if_cold = dash.cache_state(state)
-        status = Text(f"● warm {left // 60}:{left % 60:02d}", style="green") if warm else Text("○ cold", style="bold red")
+        status = Text(f"● {left // 60}:{left % 60:02d}", style="green") if warm else Text("○ cold", style="bold red")
         if if_warm is None or if_cold is None:
             next_message = Text("")
         elif warm:
@@ -260,8 +270,9 @@ def sessions_panel(dash: Dashboard) -> Panel:
             next_message = Text(f"next re-caches {_money(if_cold)}", style="red")
         table.add_row(Text(session, style="bold"), _model_text(state["model"]), status, next_message)
     if not recent:
-        table.add_row(Text("no sessions yet", style="dim"))
-    return Panel(table, title=f"sessions · prompt cache ({dash.ttl // 60} min)", title_align="left")
+        table.add_row(Text(f"no activity in the last {_duration(dash.window)}", style="dim"))
+    title = f"sessions active in the last {_duration(dash.window)} · cache {_duration(dash.ttl)}"
+    return Panel(table, title=title, title_align="left")
 
 
 def feed_panel(dash: Dashboard) -> Panel:
@@ -334,9 +345,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live cost dashboard for llm-trunk.")
     parser.add_argument("--since", default="1h", help="history to load first (default: 1h)")
     parser.add_argument("--ttl", default="5m", choices=["5m", "60m"], help="prompt-cache lifetime (default: 5m)")
+    parser.add_argument("--window", default="30m", help="show sessions active this recently, e.g. 30m or 2h (default: 30m)")
     args = parser.parse_args()
 
-    dash = Dashboard(load_prices(), load_routes(), 300 if args.ttl == "5m" else 3600)
+    window = int(args.window[:-1]) * (3600 if args.window.endswith("h") else 60)
+    dash = Dashboard(load_prices(), load_routes(), 300 if args.ttl == "5m" else 3600, window_seconds=window)
     events: queue.Queue = queue.Queue()
     stop = threading.Event()
     threading.Thread(target=stream, args=(args.since, events, stop), daemon=True).start()

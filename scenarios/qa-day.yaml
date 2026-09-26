@@ -1,0 +1,56 @@
+# A short QA workday in Claude Code, touching every kind of request llm-trunk
+# sees: normal turns, skill runs, a subagent, compaction, Claude Code's own
+# background calls (titles, suggestions, recaps happen along the way) and an
+# idle gap longer than the prompt cache lasts.
+#
+# Run with: python3 scenarios/run.py            (add --quick to skip the idle gap)
+#
+# `expect` is the check for that step's answer: text that must appear in it.
+# The demo skills start their answers with a fixed tag, which makes a simple,
+# objective pass/fail.
+name: qa-day
+
+steps:
+  - name: plain question
+    type: normal
+    send: "In one sentence: what is a regression test?"
+
+  - name: test plan
+    type: skill
+    send: "/qa-test-plan-creation Password reset by email link: the link expires after 30 minutes and works only once."
+    expect: "[DEMO TEST PLAN]"
+
+  - name: follow-up
+    type: normal
+    send: "Add one edge case about opening the link on a different device. Reply with just that bullet."
+
+  - name: test execution
+    type: skill
+    send: "/qa-test-case-execution Run the test plan above against build 2.4.1 on staging."
+    expect: "[DEMO EXECUTION REPORT]"
+
+  - name: bug report
+    type: skill
+    send: "/qa-bug-logging On build 2.4.1 the reset link still works 45 minutes after it was sent."
+    expect: "[DEMO BUG REPORT]"
+
+  - name: subagent
+    type: subagent
+    send: "Use a subagent to list the folders in .claude/skills and give one line on what each skill does."
+
+  - name: compaction
+    type: compaction
+    send: "/compact"
+
+  - name: fix verification
+    type: skill
+    send: "/qa-fix-verification Build 2.4.2 says it fixes the expired reset link bug."
+    expect: "[DEMO FIX VERIFICATION]"
+
+  - name: idle past the cache
+    type: idle
+    wait_seconds: 330
+
+  - name: back after a break
+    type: normal
+    send: "Summarize today's QA findings in two sentences."
