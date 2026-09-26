@@ -210,8 +210,7 @@ Run these in the `llm-trunk` folder on the gateway's machine.
 
 | Command | What it does |
 |---|---|
-| `python3 scripts/dashboard.py` | Live dashboard: savings, spend per request type, prompt-cache countdown per session, live feed. Starts empty; `--since 1h` adds history |
-| `python3 scripts/watch.py` | Live log, one line per request |
+| `python3 scripts/dashboard.py` | Live dashboard: savings, spend per request type, prompt-cache and sticky-tier countdowns per session, and a feed with one row per request (scroll with ↑/↓ or the mouse wheel, `g` for newest). Starts empty; `--since 1h` adds history |
 | `python3 scripts/report.py --since 24h` | Cost totals per request type, tier, day and session |
 | `python3 scripts/check_rules.py --since 1h` | Checks every logged request against the routing rules; exits with 1 on a violation |
 | `python3 scenarios/run.py --quick` | Drives a scripted Claude Code session through the gateway and checks each step's tier and answer (about $1–2 per run) |

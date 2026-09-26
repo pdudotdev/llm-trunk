@@ -8,20 +8,26 @@ Run on the machine hosting the gateway, from anywhere in the repo:
     python3 scripts/dashboard.py --ttl 60m    # prompt-cache lifetime (default 5m)
     python3 scripts/dashboard.py --window 2h  # sessions shown if active this recently (default 30m)
 
-Read-only, like scripts/watch.py, which stays the dependency-free view; this
-one needs the `rich` package. "Without llm-trunk" is an estimate: each
-request's own tokens priced at the model the client asked for (pricing.yaml),
-so a request routed to a cheaper tier shows what the tier saved. Requests
-logged before the gateway recorded the requested model can't be compared and
-are counted separately.
+Read-only; needs `rich` and `pyyaml` (pip install -r requirements-dev.txt).
+Scroll the live feed with the arrow keys or the mouse wheel (or j/k), a page
+with space/b, jump to the newest with g and the oldest with G; q quits.
+
+"Without llm-trunk" is an estimate: each request's own tokens priced at the
+model the client asked for (pricing.yaml), so a request routed to a cheaper
+tier shows what the tier saved. Requests logged before the gateway recorded
+the requested model can't be compared and are counted separately.
 """
 import argparse
+import itertools
+import os
 import queue
 import re
+import select
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,16 +44,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from report import parse  # noqa: E402
 
-from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
+from events import ICONS, REPO, STAMP_RE, fmt_tokens, pretty_model, request_type_of, route_kind  # noqa: E402
+
+from policy.decide import REQUEST_TYPES  # noqa: E402  (events puts the repo on the path)
 from policy.models import model_key  # noqa: E402
-from watch import ICONS, REPO, STAMP_RE, fmt_tokens, pretty_model, request_type_of, route_kind  # noqa: E402
 
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
+SESSION_STYLES = ["cyan", "yellow", "magenta", "green", "blue", "bright_cyan", "bright_yellow", "bright_magenta"]
 # Request types as the dashboard names them: Claude Code's own housekeeping
 # (titles, suggestions, away summaries, permission checks) reads as "internal".
 TYPE_LABELS = {"background": "internal"}
-FEED_ROWS = 14
+FEED_HISTORY = 10_000  # rows kept for scrolling back
 SESSION_ROWS = 6
+HEADER_HEIGHT, MIDDLE_HEIGHT = 4, 12
+TYPES_WIDTH = 54  # the spend panel's widest line; the sessions panel gets the rest
 
 
 # --- Prices ---------------------------------------------------------------------
@@ -119,7 +129,13 @@ class Dashboard:
         # request type -> [actual, without llm-trunk], over comparable requests only
         self.type_compare: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self.sessions: dict[str, dict] = {}
-        self.feed: deque = deque(maxlen=FEED_ROWS)
+        # session -> (skill, epoch when its sticky route expires if left idle)
+        self.sticky: dict[str, tuple[str, float]] = {}
+        self.feed: deque = deque(maxlen=FEED_HISTORY)
+        # The feed lists newest first; scroll = how many newer rows are hidden
+        # above the view. page = rows the view showed last time it was drawn.
+        self.scroll = self.unseen = 0
+        self.page = 1
 
     def add(self, when: datetime, kind: str, event: dict) -> None:
         self.first = self.first or when
@@ -128,7 +144,49 @@ class Dashboard:
             self.denies += 1
         elif kind == "spend":
             saving = self._add_spend(when, event)
+        elif kind == "expired":
+            self.sticky.pop(event.get("session"), None)
         self.feed.appendleft((when, kind, event, saving))
+        if self.scroll:
+            # Scrolled back: keep the rows in view where they are.
+            self.scroll = min(self.scroll + 1, self.max_scroll())
+            self.unseen += 1
+
+    def max_scroll(self) -> int:
+        return max(0, len(self.feed) - self.page)
+
+    def press(self, key: str) -> None:
+        """Scroll the feed: up/down a row, pgup/pgdn a page, home/end to either end."""
+        steps = {"up": -1, "down": 1, "pgup": -self.page, "pgdn": self.page}
+        if key in steps:
+            self.scroll += steps[key]
+        elif key == "home":
+            self.scroll = 0
+        elif key == "end":
+            self.scroll = self.max_scroll()
+        self.scroll = max(0, min(self.scroll, self.max_scroll()))
+        if not self.scroll:
+            self.unseen = 0
+
+    def _track_sticky(self, when: datetime, event: dict) -> None:
+        # Every request but a subagent's reports the session's sticky timer:
+        # its time left, or none once the route has ended.
+        session = event.get("session")
+        if not session or event.get("request_type") == "subagent":
+            return
+        left, skill = event.get("sticky_left_s"), event.get("skill_id")
+        if isinstance(left, (int, float)) and skill:
+            self.sticky[session] = (skill, when.timestamp() + left)
+        else:
+            self.sticky.pop(session, None)
+
+    def sticky_left(self, session: str) -> tuple[str, int] | None:
+        """(skill, seconds left) while the session's sticky route is live."""
+        if session not in self.sticky:
+            return None
+        skill, expires = self.sticky[session]
+        left = int(expires - self.clock())
+        return (skill, left) if left > 0 else None
 
     def _add_spend(self, when: datetime, event: dict) -> float | None:
         logged = event.get("cost")
@@ -140,6 +198,7 @@ class Dashboard:
         self.type_cost[kind] += cost
         self.input_tokens += event.get("input_tokens") or 0
         self.cached_tokens += event.get("cache_read_tokens") or 0
+        self._track_sticky(when, event)
         # The cache clock and "next message" price follow the main conversation:
         # subagents, titles and permission checks share the session but run
         # another model on another context.
@@ -259,66 +318,129 @@ def types_panel(dash: Dashboard) -> Panel:
     return Panel(table, title="spend by request type · vs model asked for", title_align="left")
 
 
+def _session_text(session: str | None) -> Text:
+    if not session:
+        return Text("—", style="dim")
+    return Text(session, style=SESSION_STYLES[zlib.crc32(session.encode()) % len(SESSION_STYLES)])
+
+
+def _clock(seconds: int) -> str:
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 def sessions_panel(dash: Dashboard) -> Panel:
-    table = Table.grid(padding=(0, 1))
-    for _ in range(4):
-        table.add_column(no_wrap=True, overflow="ellipsis")
+    table = Table(box=None, padding=(0, 1), show_edge=False, header_style="dim")
+    for name in ("SESSION", "MODEL", "CACHE", "NEXT MESSAGE"):
+        table.add_column(name, no_wrap=True, overflow="ellipsis")
+    # The one column that gives way on a narrow terminal (its text still won't wrap).
+    table.add_column("STICKY", no_wrap=False)
     now = dash.clock()
     active = [(session, state) for session, state in dash.sessions.items() if now - state["last"] <= dash.window]
     recent = sorted(active, key=lambda item: -item[1]["last"])[:SESSION_ROWS]
     for session, state in recent:
         warm, left, if_warm, if_cold = dash.cache_state(state)
-        status = Text(f"● {left // 60}:{left % 60:02d}", style="green") if warm else Text("○ cold", style="bold red")
+        status = Text(f"● {_clock(left)}", style="green") if warm else Text("○ cold", style="bold red")
         if if_warm is None or if_cold is None:
             next_message = Text("")
         elif warm:
-            next_message = Text(f"next {_money(if_warm)} · cold {_money(if_cold)}", style="dim")
+            next_message = Text(f"{_money(if_warm)} · cold {_money(if_cold)}", style="dim")
         else:
             next_message = Text(f"next re-cache costs {_money(if_cold)}", style="red")
-        table.add_row(Text(session, style="bold"), _model_text(state["model"]), status, next_message)
+        sticky = dash.sticky_left(session)
+        sticky_text = Text(f"{ICONS['sticky']} {_clock(sticky[1])} {sticky[0]}" if sticky else "—",
+                           style="yellow" if sticky else "dim", no_wrap=True, overflow="ellipsis")
+        table.add_row(_session_text(session), _model_text(state["model"]), status, next_message, sticky_text)
     if not recent:
         table.add_row(Text(f"no activity in the last {_duration(dash.window)}", style="dim"))
     title = f"sessions active in the last {_duration(dash.window)} · cache {_duration(dash.ttl)}"
     return Panel(table, title=title, title_align="left")
 
 
-def feed_panel(dash: Dashboard) -> Panel:
-    table = Table(box=None, padding=(0, 1), show_edge=False, header_style="dim")
-    for name, justify in (("TIME", "left"), ("ROUTE", "left"), ("REQ TYPE", "left"), ("TIER", "left"), ("MODEL", "left"),
-                          ("EFFORT", "left"), ("INPUT", "right"), ("COST", "right"), ("VS ASKED", "right")):
-        table.add_column(name, justify=justify, no_wrap=True)
-    for when, kind, event, saving in dash.feed:
-        clock = f"{when:%H:%M:%S}"
-        if kind == "spend":
-            route = route_kind(event)
-            label = f"{ICONS[route]} {route}" + (" (i)" if event.get("background") else "")
-            cached = event.get("cache_read_tokens") or 0
-            tokens = event.get("input_tokens")
-            size = fmt_tokens(tokens) + (" (c)" if tokens and cached * 2 >= tokens else "")
-            cost = event.get("cost")
-            effort = event.get("effort")
-            table.add_row(
-                Text(clock, style="dim"), Text(label, style="bold" if route == "invoked" else ""),
-                type_text(event), event.get("tier") or Text("—", style="dim"),
-                _model_text(served_model(event, dash.routes, dash.prices)), effort or Text("—", style="dim"),
-                size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
-            )
-        elif kind == "deny":
-            reason = str(event.get("reason", "")).removeprefix("llm-trunk: ")
-            table.add_row(Text(clock, style="dim"), Text(f"{ICONS['denied']} denied", style="red"), Text(reason[:70], style="red"))
-        elif kind == "failed":
-            table.add_row(Text(clock, style="dim"), Text(f"{ICONS['failed']} failed", style="red"),
-                          type_text(event), event.get("tier") or "", Text(f"upstream {event.get('status') or 'error'}", style="red"))
-        else:
-            table.add_row(Text(clock, style="dim"), Text(f"{ICONS['expired']} expired", style="yellow"),
-                          Text(f"{event.get('skill_id')} ({event.get('why')}) → back to untagged", style="yellow"))
-    return Panel(table, title="live", title_align="left")
+# (header, right-aligned)
+FEED_COLUMNS = (("TIME", False), ("SESSION", False), ("ROUTE", False), ("REQ TYPE", False), ("TIER", False),
+                ("MODEL", False), ("EFFORT", False), ("INPUT", True), ("COST", True), ("VS ASKED", True))
+GAP = "  "
 
 
-def render(dash: Dashboard) -> Layout:
+def feed_row(dash: Dashboard, when: datetime, kind: str, event: dict, saving: float | None) -> tuple[list, Text | None]:
+    """(the row's leading cells, the detail that runs on to the end of the line)."""
+    lead = [Text(f"{when:%H:%M:%S}", style="dim"), _session_text(event.get("session"))]
+    if kind == "spend":
+        route = route_kind(event)
+        label = f"{ICONS[route]} {route}" + (" (i)" if event.get("background") else "")
+        cached = event.get("cache_read_tokens") or 0
+        tokens = event.get("input_tokens")
+        size = fmt_tokens(tokens) + (" (c)" if tokens and cached * 2 >= tokens else "")
+        cost = event.get("cost")
+        effort = event.get("effort")
+        return [
+            *lead, Text(label, style="bold" if route == "invoked" else ""),
+            type_text(event), event.get("tier") or Text("—", style="dim"),
+            _model_text(served_model(event, dash.routes, dash.prices)), effort or Text("—", style="dim"),
+            size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
+        ], None
+    if kind == "deny":
+        reason = str(event.get("reason", "")).removeprefix("llm-trunk: ")
+        return [*lead, Text(f"{ICONS['denied']} denied", style="red"), type_text(event)], Text(reason, style="red")
+    if kind == "failed":
+        error = " ".join(str(event.get("error") or "").split())
+        detail = f"upstream {event.get('status') or 'error'}" + (f": {error}" if error else "")
+        cells = [*lead, Text(f"{ICONS['failed']} failed", style="red"), type_text(event), event.get("tier") or ""]
+        return cells, Text(detail, style="red")
+    detail = f"{event.get('skill_id')} ({event.get('why')}) → back to untagged"
+    return [*lead, Text(f"{ICONS['expired']} expired", style="yellow"), "", event.get("tier") or ""], Text(detail, style="yellow")
+
+
+def feed_lines(rows: list[tuple[list, Text | None]]) -> list[Text]:
+    """Lay the rows out in columns sized to what's shown. A row's detail starts
+    after its last cell and runs on; the panel cuts off whatever doesn't fit."""
+    rows = [([cell if isinstance(cell, Text) else Text(cell) for cell in cells], detail) for cells, detail in rows]
+    widths = [len(name) for name, _ in FEED_COLUMNS]
+    for cells, _ in rows:
+        for i, cell in enumerate(cells):
+            widths[i] = max(widths[i], cell.cell_len)
+    header = [(Text(name, style="dim"), right) for name, right in FEED_COLUMNS]
+    lines = []
+    for cells, detail in [([cell for cell, _ in header], None), *rows]:
+        line = Text(no_wrap=True, overflow="ellipsis")
+        for i, cell in enumerate(cells):
+            pad = " " * (widths[i] - cell.cell_len)
+            line.append_text(Text(pad) + cell if FEED_COLUMNS[i][1] else cell + Text(pad))
+            if i < len(cells) - 1 or detail:
+                line.append(GAP)
+        if detail:
+            line.append_text(detail)
+        line.rstrip()
+        lines.append(line)
+    return lines
+
+
+def feed_panel(dash: Dashboard, rows: int) -> Panel:
+    dash.page = max(1, rows)
+    dash.scroll = min(dash.scroll, dash.max_scroll())
+    shown = list(itertools.islice(dash.feed, dash.scroll, dash.scroll + dash.page))
+    lines = feed_lines([feed_row(dash, *item) for item in shown])
+    total = len(dash.feed)
+    if dash.scroll:
+        title = f"live · paused · rows {dash.scroll + 1}–{dash.scroll + len(shown)} of {total}"
+        if dash.unseen:
+            title += f" · {dash.unseen} new above"
+        subtitle = Text("g: back to live", style="bold yellow")
+    else:
+        title = f"live · {total} rows" if total > len(shown) else "live"
+        subtitle = Text("↑↓/wheel: scroll · space/b: page · g/G: newest/oldest · q: quit", style="dim")
+    return Panel(Group(*lines), title=title, subtitle=subtitle, title_align="left", subtitle_align="right")
+
+
+def render(dash: Dashboard, height: int) -> Layout:
+    # The feed gets whatever height is left: its panel border and header row
+    # take 3 lines, the rest are request rows.
+    feed_rows = height - HEADER_HEIGHT - MIDDLE_HEIGHT - 3
     layout = Layout()
-    layout.split_column(Layout(header(dash), size=4), Layout(name="middle", size=12), Layout(feed_panel(dash)))
-    layout["middle"].split_row(Layout(types_panel(dash)), Layout(sessions_panel(dash)))
+    layout.split_column(
+        Layout(header(dash), size=HEADER_HEIGHT), Layout(name="middle", size=MIDDLE_HEIGHT), Layout(feed_panel(dash, feed_rows))
+    )
+    layout["middle"].split_row(Layout(types_panel(dash), size=TYPES_WIDTH), Layout(sessions_panel(dash)))
     return layout
 
 
@@ -326,7 +448,7 @@ def render(dash: Dashboard) -> Layout:
 
 
 def stream(since: str, events: queue.Queue, stop: threading.Event) -> None:
-    """Follow the gateway log, reconnecting when it restarts; like watch.py."""
+    """Follow the gateway log, reconnecting when it restarts without repeating a line."""
     resume_after = None
     while not stop.is_set():
         command = ["docker", "compose", "logs", "-f", "-t", "--no-log-prefix", "--since", since, "litellm"]
@@ -347,6 +469,40 @@ def stream(since: str, events: queue.Queue, stop: threading.Event) -> None:
             process.wait()
         since = resume_after or since
         stop.wait(2)
+
+
+# Key presses -> dashboard actions. Terminals send the mouse wheel in the
+# full-screen view as arrow keys; the letter keys cover a laptop keyboard
+# whose Page Up/Home/End the terminal keeps for itself.
+KEYS = {
+    "\x1b[A": "up", "\x1bOA": "up", "k": "up",
+    "\x1b[B": "down", "\x1bOB": "down", "j": "down",
+    "\x1b[5~": "pgup", "b": "pgup",
+    "\x1b[6~": "pgdn", " ": "pgdn",
+    "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "g": "home",
+    "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "G": "end",
+    "q": "quit",
+}
+
+
+def parse_keys(data: str) -> list[str]:
+    """Raw terminal input -> action names; anything else is skipped."""
+    keys, i = [], 0
+    while i < len(data):
+        match = next((seq for seq in sorted(KEYS, key=len, reverse=True) if data.startswith(seq, i)), None)
+        if match:
+            keys.append(KEYS[match])
+            i += len(match)
+        else:
+            i += 1
+    return keys
+
+
+def read_keys(fd: int, keys: queue.Queue, stop: threading.Event) -> None:
+    while not stop.is_set():
+        if select.select([fd], [], [], 0.2)[0]:
+            for key in parse_keys(os.read(fd, 1024).decode(errors="ignore")):
+                keys.put(key)
 
 
 def duration(text: str) -> int:
@@ -370,17 +526,44 @@ def main() -> None:
     # Without --since, start fresh: earlier sessions would only confuse a new run.
     since = args.since or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     threading.Thread(target=stream, args=(since, events, stop), daemon=True).start()
+    keys: queue.Queue = queue.Queue()
+    console = Console()
+    saved_tty = None
+    if sys.stdin.isatty():
+        import termios
+        import tty
+
+        # Read keys one at a time, unechoed; Ctrl+C still stops the dashboard.
+        fd = sys.stdin.fileno()
+        saved_tty = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        threading.Thread(target=read_keys, args=(fd, keys, stop), daemon=True).start()
     try:
-        with Live(render(dash), screen=True, auto_refresh=False, console=Console()) as live:
+        with Live(render(dash, console.size.height), screen=True, auto_refresh=False, console=console) as live:
+            # Ask the terminal to send the mouse wheel as arrow keys (most do by default).
+            console.file.write("\x1b[?1007h")
             while True:
+                pressed = []
+                try:
+                    pressed.append(keys.get(timeout=0.5))
+                    while not keys.empty():
+                        pressed.append(keys.get())
+                except queue.Empty:
+                    pass
+                if "quit" in pressed:
+                    break
                 while not events.empty():
                     dash.add(*events.get())
-                live.update(render(dash), refresh=True)
-                time.sleep(0.5)
+                for key in pressed:
+                    dash.press(key)
+                live.update(render(dash, console.size.height), refresh=True)
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
+        console.file.write("\x1b[?1007l")
+        if saved_tty is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved_tty)
 
 
 if __name__ == "__main__":
