@@ -211,3 +211,31 @@ def test_feed_shows_tier_and_skill():
     dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate", alias="untagged"))
     screen = _screen(dash)
     assert "complex · design-review" in screen and "🤖 subagent" in screen
+
+
+def test_session_clock_follows_the_main_conversation_only():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(request_type="normal", alias="plan-lane", input_tokens=120_000))
+    dash.add(T0, "spend", _spend(request_type="subagent", alias="untagged", input_tokens=15_000))
+    dash.add(T0, "spend", _spend(request_type="background", background="title", input_tokens=900))
+    dash.add(T0, "spend", _spend(request_type="background", background="permission_check", input_tokens=2_000))
+    state = dash.sessions["s1"]
+    assert state["context"] == 120_000 and state["model"] == ROUTES["plan-lane"]
+
+
+@pytest.mark.parametrize(("text", "seconds"), [("30m", 1800), ("2h", 7200), ("5m", 300)])
+def test_window_durations(text, seconds):
+    assert dashboard.duration(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["2d", "90", "0m", "h", "1.5h"])
+def test_window_rejects_what_it_would_misread(text):
+    with pytest.raises(Exception):
+        dashboard.duration(text)
+
+
+def test_request_types_have_one_definition():
+    from policy.decide import REQUEST_TYPES
+
+    assert dashboard.REQUEST_TYPES is REQUEST_TYPES
+    assert __import__("report").REQUEST_TYPES is REQUEST_TYPES

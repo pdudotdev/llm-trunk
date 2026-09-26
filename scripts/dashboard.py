@@ -37,9 +37,10 @@ from rich.text import Text
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from report import parse  # noqa: E402
+
+from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
 from watch import ICONS, REPO, STAMP_RE, fmt_tokens, lane_text, model_key, pretty_model, request_type_of, route_kind  # noqa: E402
 
-REQUEST_TYPES = ("normal", "skill", "subagent", "compaction", "background")
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
 FEED_ROWS = 14
 SESSION_ROWS = 6
@@ -135,7 +136,11 @@ class Dashboard:
         self.type_cost[kind] += cost
         self.input_tokens += event.get("input_tokens") or 0
         self.cached_tokens += event.get("cache_read_tokens") or 0
-        if event.get("session") and isinstance(event.get("input_tokens"), (int, float)):
+        # The cache clock and "next message" price follow the main conversation:
+        # subagents, titles and permission checks share the session but run
+        # another model on another context.
+        main_turn = kind in ("normal", "skill") and not event.get("background")
+        if main_turn and event.get("session") and isinstance(event.get("input_tokens"), (int, float)):
             self.sessions[event["session"]] = {
                 "last": when.timestamp(),
                 "model": routed_model,
@@ -331,15 +336,22 @@ def stream(since: str, events: queue.Queue, stop: threading.Event) -> None:
         stop.wait(2)
 
 
+def duration(text: str) -> int:
+    """'30m' / '2h' -> seconds; anything else is an error, not a guess."""
+    match = re.fullmatch(r"(\d+)([mh])", text.strip())
+    if not match or int(match.group(1)) == 0:
+        raise argparse.ArgumentTypeError(f"{text!r}: use minutes or hours, e.g. 30m or 2h")
+    return int(match.group(1)) * (60 if match.group(2) == "m" else 3600)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live cost dashboard for llm-trunk.")
     parser.add_argument("--since", default="1h", help="history to load first (default: 1h)")
     parser.add_argument("--ttl", default="5m", choices=["5m", "60m"], help="prompt-cache lifetime (default: 5m)")
-    parser.add_argument("--window", default="30m", help="show sessions active this recently, e.g. 30m or 2h (default: 30m)")
+    parser.add_argument("--window", default="30m", type=duration, help="show sessions active this recently, e.g. 30m or 2h (default: 30m)")
     args = parser.parse_args()
 
-    window = int(args.window[:-1]) * (3600 if args.window.endswith("h") else 60)
-    dash = Dashboard(load_prices(), load_routes(), 300 if args.ttl == "5m" else 3600, window_seconds=window)
+    dash = Dashboard(load_prices(), load_routes(), 300 if args.ttl == "5m" else 3600, window_seconds=args.window)
     events: queue.Queue = queue.Queue()
     stop = threading.Event()
     threading.Thread(target=stream, args=(args.since, events, stop), daemon=True).start()

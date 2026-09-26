@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from watch import EVENT_RE, REPO, STAMP_RE, request_type_of  # noqa: E402
 
-REQUEST_TYPES = ("normal", "skill", "subagent", "compaction", "background")
+from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
 
 
 def parse(lines) -> list[tuple[datetime, str, dict]]:

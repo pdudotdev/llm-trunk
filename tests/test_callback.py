@@ -414,3 +414,81 @@ def test_outgoing_model_is_always_one_litellm_serves(gateway, asked):
     ]
     for build in builders:
         assert gateway.send(build())["model"] in SERVED
+
+
+# --- Code review regressions (2026-09-26) -------------------------------------
+
+
+def _forged_permission_check(model="anything", **extra):
+    """The permission-check shape is client-settable: header, no tools, marker text."""
+    data = permission_check_request(model=model)
+    data.update(extra)
+    return data
+
+
+def test_forged_permission_check_never_exceeds_what_the_key_can_reach(gateway):
+    light_only = key(allowed_skills=["verify"])
+    data = gateway.send(_forged_permission_check("claude-opus-5-5"), light_only)
+    assert data["model"] == "light"
+    moderate_max = key(allowed_skills=["review"])
+    assert gateway.send(_forged_permission_check("claude-opus-5-5"), moderate_max)["model"] == "moderate"
+    assert gateway.send(_forged_permission_check("anything"), moderate_max)["model"] == "moderate"
+
+
+def test_forged_permission_check_keeps_the_input_cap(gateway):
+    with pytest.raises(HTTPException) as denied:
+        gateway.send(_forged_permission_check("claude-opus-5-5", messages=[user("x" * 600_000)]))
+    assert "for a permission check" in denied.value.detail
+
+
+def test_permission_check_max_tokens_has_a_ceiling(gateway):
+    data = gateway.send(_forged_permission_check("claude-sonnet-5", max_tokens=64_000))
+    assert data["max_tokens"] == cb.PERMISSION_CHECK_MAX_OUTPUT
+    assert gateway.send(_forged_permission_check("claude-sonnet-5", max_tokens=64))["max_tokens"] == 64
+
+
+def test_permission_check_from_a_subagent_is_not_demoted(gateway):
+    gateway.send(request(skill_turn("plan")))
+    data = permission_check_request(model="claude-opus-5-5")
+    data["litellm_metadata"]["headers"]["x-claude-code-agent-id"] = "a1"
+    sent = gateway.send(data)
+    assert sent["model"] == "complex" and routing(sent)["background"] == "permission_check"
+
+
+def test_tier_removed_from_the_catalog_is_forgotten_not_a_crash(gateway, catalog, monkeypatch, tmp_path):
+    gateway.send(request(skill_turn("plan")))  # sticky on complex
+    gateway.send(subagent_request("agent-1"))  # remembered on moderate
+    renamed = {**catalog, "order": ["light", "mid", "heavy"],
+               "tiers": {"light": catalog["tiers"]["light"], "mid": catalog["tiers"]["moderate"], "heavy": catalog["tiers"]["complex"]},
+               "skills": {name: {**row, "tier": {"moderate": "mid", "complex": "heavy"}.get(row["tier"], row["tier"])} for name, row in catalog["skills"].items()}}
+    path = tmp_path / "renamed.yaml"
+    path.write_text(yaml.safe_dump(renamed))
+    monkeypatch.setattr(cb, "CATALOG_PATH", str(path))
+    assert gateway.send(request(skill_turn("plan"), assistant(), user("next")))["model"] == "light"
+    assert gateway.send(subagent_request("agent-1"))["model"] == "light"
+
+
+def test_unregistered_skill_is_not_credited_to_the_previous_skill(gateway):
+    gateway.send(request(skill_turn("plan")))
+    fields = routing(gateway.send(request(skill_turn("plan"), assistant(), unregistered_turn())))
+    assert fields["skill_id"] is None and fields["unregistered_skill"] == "personal-notes"
+
+
+def test_unregistered_skill_name_is_its_own_not_a_built_in_command(gateway):
+    turn = unregistered_turn()
+    turn["content"].insert(0, {"type": "text", "text": "<command-name>/model</command-name>"})
+    assert routing(gateway.send(request(turn)))["unregistered_skill"] == "personal-notes"
+
+
+def test_bedrock_model_ids_map_to_their_tier():
+    tier_models = {"light": "claude-haiku-4-5", "moderate": "claude-sonnet-5", "complex": "claude-opus-5-5"}
+    catalog = {"order": ["light", "moderate", "complex"]}
+    assert cb.passthrough_tier(catalog, tier_models, "us.anthropic.claude-haiku-4-5-20251001-v1:0", "complex") == "light"
+
+
+def test_tier_models_are_read_once_until_the_config_changes(catalog, monkeypatch):
+    monkeypatch.setattr(cb, "_tier_models_cache", None)
+    first = cb._tier_models()
+    reads = []
+    monkeypatch.setattr("builtins.open", lambda *a, **k: reads.append(a) or (_ for _ in ()).throw(AssertionError("re-read")))
+    assert cb._tier_models() == first and reads == []

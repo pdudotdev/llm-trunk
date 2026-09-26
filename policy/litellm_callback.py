@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from collections import OrderedDict
@@ -10,6 +11,7 @@ from litellm.integrations.custom_logger import CustomLogger
 
 from policy.decide import BACKGROUND, COMPACTION, NORMAL, SKILL, SUBAGENT, decide, lowest
 from policy.hash import sha256_hex
+from policy.models import model_key
 
 
 def _log(message: str) -> None:
@@ -74,28 +76,35 @@ def _load_catalog() -> dict:
         return yaml.safe_load(f)
 
 
-def _model_family(model: str | None) -> str:
-    """claude-opus-5-5-20260915 / anthropic/claude-opus-5-5[1m] -> claude-opus-5-5."""
-    name = (model or "").lower().split("/")[-1].replace("[1m]", "")
-    return re.sub(r"-\d{8}$", "", name)
+_tier_models_cache: tuple[float, dict[str, str]] | None = None
 
 
 def _tier_models() -> dict[str, str]:
-    """Tier -> the model family it runs, from LiteLLM's own config."""
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
-    return {entry["model_name"]: _model_family(entry["litellm_params"]["model"]) for entry in config["model_list"]}
+    """Tier -> the model family it runs, from LiteLLM's own config. Re-read
+    only when the file changes: permission checks run before most tool calls."""
+    global _tier_models_cache
+    mtime = os.path.getmtime(CONFIG_PATH)
+    if _tier_models_cache is None or _tier_models_cache[0] != mtime:
+        with open(CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+        models = {entry["model_name"]: model_key(entry["litellm_params"]["model"]) for entry in config["model_list"]}
+        _tier_models_cache = (mtime, models)
+    return _tier_models_cache[1]
 
 
-def passthrough_tier(catalog: dict, tier_models: dict[str, str], requested_model: str | None) -> str:
-    """The tier that runs the model the client asked for. LiteLLM only serves
-    the tiers it's configured with, so a request can't keep a raw model name;
-    when no tier runs that model, the most capable tier -- never a weaker one."""
-    wanted = _model_family(requested_model)
-    for tier in reversed(catalog["order"]):
+def passthrough_tier(catalog: dict, tier_models: dict[str, str], requested_model: str | None, ceiling: str) -> str:
+    """The tier that runs the model the client asked for, up to `ceiling` (the
+    highest tier the key may reach). LiteLLM only serves the tiers it's
+    configured with, so a request can't keep a raw model name; when no tier
+    runs that model, the ceiling -- the most capable the key allows, never a
+    weaker one."""
+    order = catalog["order"]
+    reachable = order[: order.index(ceiling) + 1]
+    wanted = model_key(requested_model)
+    for tier in reversed(reachable):
         if tier_models.get(tier) == wanted:
             return tier
-    return catalog["order"][-1]
+    return ceiling
 
 
 def _message_text(content: Any) -> str:
@@ -310,6 +319,9 @@ PERMISSION_CHECK_MARKER = "You are a security monitor for autonomous AI coding a
 # /compact and auto-compaction resend the conversation with this block
 # appended to the newest user turn (checked on the wire).
 COMPACTION_PREFIX = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."
+# Claude Code's permission checks ask for at most this many tokens (checked on
+# the wire); a larger ask is not one of them.
+PERMISSION_CHECK_MAX_OUTPUT = 8192
 # Set on every request a subagent makes, one id per subagent.
 AGENT_HEADER = "x-claude-code-agent-id"
 MAX_AGENTS = 1024
@@ -355,12 +367,14 @@ def _invoked_skill_name(blocks: list[str], tool_names: list[str]) -> str | None:
 
     A skill arrives with its "Base directory for this skill" block; built-in
     commands such as /model or /compact never do, so they don't count."""
-    if not any(BASE_DIR_RE.search(block) for block in blocks):
+    body = next((index for index, block in enumerate(blocks) if BASE_DIR_RE.search(block)), None)
+    if body is None:
         return None
-    for block in blocks:
-        match = COMMAND_NAME_RE.search(block)
-        if match:
-            return match.group("name")
+    # The skill's own tag is the last one before its body; an earlier tag in
+    # the same turn may be a built-in command such as /model.
+    tags = [match.group("name") for block in blocks[: body + 1] for match in COMMAND_NAME_RE.finditer(block)]
+    if tags:
+        return tags[-1]
     return tool_names[0] if tool_names else "unknown"
 
 
@@ -499,15 +513,29 @@ class SkillRoutingCallback(CustomLogger):
         _log(f"llm-trunk: malformed allowed_skills {allowed!r}; key restricted to the lowest tier")
         return set()
 
+    @staticmethod
+    def _highest_tier(catalog: dict, allowed: set[str] | None) -> str:
+        """The highest tier a key can reach: any tier when unrestricted, else
+        the highest tier among the skills it may use (the lowest if none)."""
+        order = catalog["order"]
+        if allowed is None:
+            return order[-1]
+        tiers = [catalog["skills"][skill]["tier"] for skill in allowed if skill in catalog["skills"]]
+        return max(tiers, key=order.index, default=order[0])
+
     def _classify(self, data: dict, headers: dict, catalog: dict, user_api_key_dict) -> dict:
         """What this request is: request type plus the facts routing needs."""
+        background = _background_call(data, headers)
+        if background == "permission_check":
+            # First, even when a subagent's action is being checked: the check
+            # must not be demoted along with the subagent.
+            return {"request_type": BACKGROUND, "background": background}
         agent_id = _header(headers, AGENT_HEADER)
         if agent_id:
             # A subagent's own skill invocations don't lift it above its tier.
             return {"request_type": SUBAGENT, "agent_id": agent_id}
         if _is_compaction(data, headers):
             return {"request_type": COMPACTION}
-        background = _background_call(data, headers)
         if background:
             return {"request_type": BACKGROUND, "background": background}
 
@@ -552,10 +580,20 @@ class SkillRoutingCallback(CustomLogger):
         allowed = self._allowed_skills(user_api_key_dict)
         if sticky is not None and allowed is not None and sticky[1] not in allowed:
             sticky = None
+        # Sticky and subagent tiers live in memory, but catalog.yaml is re-read
+        # on every request: a tier renamed or removed since is forgotten, not
+        # a crash.
+        if sticky is not None and sticky[0] not in catalog["tiers"]:
+            self._sticky.pop(session_key, None)
+            sticky = None
         session_tier = sticky[0] if sticky else None
         agent_key = (session_key, request.get("agent_id") or "")
+        if self._agents.get(agent_key) not in (None, *catalog["tiers"]):
+            del self._agents[agent_key]
         routing = {
-            "skill_id": request.get("skill_id") or (sticky[1] if sticky and request_type != SUBAGENT else None),
+            # A skill request names its own skill (None when unregistered);
+            # other requests show the session's sticky skill.
+            "skill_id": request.get("skill_id") if request_type in (SKILL, SUBAGENT) else (sticky[1] if sticky else None),
             "skill_hash": request.get("skill_hash"),
             "request_type": request_type,
             "session_tier": session_tier or lowest(catalog),
@@ -570,8 +608,21 @@ class SkillRoutingCallback(CustomLogger):
         if background == "permission_check":
             # Claude Code picks this model on purpose; a weaker one would weaken
             # the safety check. It goes to the tier running that model, with
-            # effort and limits exactly as Claude Code sent them.
-            tier = passthrough_tier(catalog, _tier_models(), requested_model)
+            # Claude Code's own effort. Its shape can be forged, though, so it
+            # never reaches a tier the key couldn't reach with a skill, and
+            # keeps that tier's input cap and a max_tokens ceiling.
+            ceiling = self._highest_tier(catalog, allowed)
+            tier = passthrough_tier(catalog, _tier_models(), requested_model, ceiling)
+            cap = catalog["tiers"][tier]["max_input"]
+            if routing["estimated_input_tokens"] >= cap:
+                reason = (
+                    f"llm-trunk: ~{routing['estimated_input_tokens']} input tokens exceeds the {tier} tier cap "
+                    f"({cap}) for a permission check"
+                )
+                _log_event("deny", {"code": "input_cap", "reason": reason, "session": routing["session"],
+                                    "background": background, "request_type": request_type})
+                raise HTTPException(status_code=DENY_STATUS, detail=reason)
+            data["max_tokens"] = min(data.get("max_tokens") or PERMISSION_CHECK_MAX_OUTPUT, PERMISSION_CHECK_MAX_OUTPUT)
             data["model"] = tier
             data.setdefault("litellm_metadata", {})["skill_routing"] = {
                 **routing, "skill_id": None, "alias": tier, "tier": tier, "effort": None, "sticky_expires_at": None,

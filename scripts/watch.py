@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from policy.models import model_key  # noqa: E402  (re-exported for the other scripts)
 
 STAMP_RE = re.compile(r"^(?P<stamp>(?P<second>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*)\s+(?P<message>.*)$")
 # The gateway writes one JSON line per outcome: "llm-trunk <kind>: {...}".
@@ -73,16 +76,6 @@ def pretty_model(model_id: str) -> str:
     if not match:
         return name
     return f"{match.group(1).capitalize()} {match.group(2).replace('-', '.')}"
-
-
-def model_key(model: str | None) -> str | None:
-    """Any spelling of a Claude model id -> the key used in pricing.yaml."""
-    if not model:
-        return None
-    name = model.lower().split("/")[-1].replace("[1m]", "")
-    name = re.sub(r"^(?:[a-z-]+\.)?anthropic\.", "", name)  # Bedrock: us.anthropic.claude-...
-    name = re.sub(r"-v\d+(?::\d+)?$", "", name)  # Bedrock: ...-v1:0
-    return re.sub(r"-\d{8}$", "", name)  # dated snapshot: ...-20251001
 
 
 def load_models() -> dict[str, str]:
