@@ -208,7 +208,7 @@ def _latest_user_blocks(data: dict) -> list[str]:
 
 def _log_event(kind: str, fields: dict) -> None:
     # One JSON line per outcome -- spend, deny, expired, failed -- which
-    # scripts/watch.py renders. Structured so a client-supplied value (e.g. a
+    # scripts/events.py parses. Structured so a client-supplied value (e.g. a
     # conversation id with spaces) can't break or hide a line.
     _log(f"llm-trunk {kind}: " + json.dumps(fields))
 
@@ -755,7 +755,7 @@ class SkillRoutingCallback(CustomLogger):
                 "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
                 "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
                 # Reads only: a cache *write* is billed at 1.25x, the opposite
-                # of what the watcher's "(c)" tag claims.
+                # of what the dashboard's "(c)" tag claims.
                 "cache_read_tokens": _usage_value(usage, "cache_read_input_tokens"),
                 # Both are included in input_tokens (LiteLLM adds them in).
                 "cache_write_tokens": _usage_value(usage, "cache_creation_input_tokens"),

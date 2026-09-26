@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from report import parse  # noqa: E402
-from watch import REPO  # noqa: E402
+from events import REPO  # noqa: E402
 
 from policy.decide import lowest, one_down  # noqa: E402
 from policy.models import model_key  # noqa: E402

@@ -6,7 +6,7 @@ Run on the machine hosting the gateway, from anywhere in the repo:
     python3 scripts/report.py              # everything still in the log
     python3 scripts/report.py --since 24h
 
-Read-only: it reads the same `llm-trunk` log lines as scripts/watch.py and
+Read-only: it reads the same `llm-trunk` log lines as the dashboard and
 totals them per request type, tier, day and session. Costs are LiteLLM's estimates
 at the configured prices, not an invoice. Docker keeps the log only while the
 container exists, so a `docker compose up -d` that recreates it starts over.
@@ -22,9 +22,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from watch import EVENT_RE, REPO, STAMP_RE, request_type_of  # noqa: E402
+from events import EVENT_RE, REPO, STAMP_RE, request_type_of  # noqa: E402
 
-from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
+from policy.decide import REQUEST_TYPES  # noqa: E402  (events puts the repo on the path)
 
 
 def parse(lines) -> list[tuple[datetime, str, dict]]:

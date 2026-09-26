@@ -109,9 +109,9 @@ def test_cache_clock_warm_then_cold():
     assert dash.cache_state(dash.sessions["s1"])[0] is False
 
 
-def _screen(dash) -> str:
-    console = Console(record=True, width=120, height=40, color_system=None)
-    console.print(dashboard.render(dash))
+def _screen(dash, width=120) -> str:
+    console = Console(record=True, width=width, height=40, color_system=None)
+    console.print(dashboard.render(dash, 40))
     return console.export_text()
 
 
@@ -189,7 +189,7 @@ def test_warm_session_line_is_not_truncated():
     dash = _dashboard()
     dash.add(T0, "spend", _spend(alias="complex", input_tokens=53_000))
     screen = _screen(dash)
-    assert "next $0.011 · cold $0.265" in screen
+    assert "NEXT MESSAGE" in screen and "$0.011 · cold $0.265" in screen
 
 
 def test_spend_pane_groups_by_request_type():
@@ -250,3 +250,119 @@ def test_window_durations(text, seconds):
 def test_window_rejects_what_it_would_misread(text):
     with pytest.raises(argparse.ArgumentTypeError, match="use minutes or hours"):
         dashboard.duration(text)
+
+
+def test_feed_names_each_rows_session():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(session="a1b2c3d4"))
+    dash.add(T0, "deny", {"reason": "llm-trunk: too big", "session": "ffee0011", "request_type": "normal"})
+    feed = _screen(dash).split("─ live")[1]
+    assert "SESSION" in feed and "a1b2c3d4" in feed and "ffee0011" in feed
+
+
+def test_deny_reason_runs_to_the_end_of_the_line():
+    dash = _dashboard()
+    reason = ("llm-trunk: skill 'change-review' changed since it was hashed (got 3f2a9c41d0e7, catalog has "
+              "8b1e77c2a9d4) — re-run scripts/hash_skill.py and update catalog.yaml")
+    dash.add(T0, "spend", _spend())
+    dash.add(T0, "deny", {"code": "stale_hash", "reason": reason, "session": "s1", "request_type": "skill"})
+    assert reason.removeprefix("llm-trunk: ") in _screen(dash, width=200)
+    narrow = _screen(dash)  # cut off at the edge, without squeezing the other rows
+    assert "changed since it was hashed" in narrow and "update catalog.yaml" not in narrow
+    assert "40k (c)  $0.007" in narrow
+
+
+def _busy(clock, rows):
+    dash = _dashboard(clock)
+    for i in range(rows):
+        dash.add(T0, "spend", _spend(session=f"r{i:04d}"))
+    return dash
+
+
+def test_feed_fills_the_screen_and_keeps_history():
+    dash = _busy(Clock(), 200)
+    screen = _screen(dash)  # 40 lines: 21 request rows
+    assert "r0199" in screen and "r0179" in screen and "r0178" not in screen
+    assert "live · 200 rows" in screen
+    assert len(dash.feed) == 200
+
+
+def test_scrolling_back_through_the_feed():
+    dash = _busy(Clock(), 200)
+    _screen(dash)
+    dash.press("pgdn")
+    screen = _screen(dash)
+    assert "r0178" in screen and "r0179" not in screen
+    assert "paused · rows 22–42 of 200" in screen and "g: back to live" in screen
+    dash.press("end")
+    assert "r0000" in _screen(dash)
+    dash.press("down")  # already at the oldest row
+    assert dash.scroll == 200 - dash.page
+    dash.press("home")
+    assert dash.scroll == 0 and "r0199" in _screen(dash)
+    dash.press("up")  # already at the newest row
+    assert dash.scroll == 0
+
+
+def test_new_rows_do_not_move_a_scrolled_view():
+    clock = Clock()
+    dash = _busy(clock, 100)
+    _screen(dash)
+    dash.press("down")
+    dash.press("down")
+    dash.add(T0, "spend", _spend(session="new00001"))
+    screen = _screen(dash)
+    assert "r0097" in screen.split("\n")[18]  # still the first row shown
+    assert "new00001" not in screen and "1 new above" in screen
+    dash.press("home")
+    screen = _screen(dash)
+    assert "new00001" in screen and "new above" not in screen
+
+
+def test_scrolling_is_harmless_on_a_short_feed():
+    dash = _busy(Clock(), 3)
+    _screen(dash)
+    for key in ("down", "pgdn", "end"):
+        dash.press(key)
+        assert dash.scroll == 0
+
+
+@pytest.mark.parametrize(
+    ("data", "keys"),
+    [
+        ("\x1b[A\x1b[A\x1b[B", ["up", "up", "down"]),  # arrows, or the mouse wheel
+        ("\x1bOA\x1bOB", ["up", "down"]),  # arrows in application mode
+        ("\x1b[5~\x1b[6~ b", ["pgup", "pgdn", "pgdn", "pgup"]),
+        ("gG\x1b[H\x1b[F", ["home", "end", "home", "end"]),
+        ("jkxq", ["down", "up", "quit"]),
+        ("\x1b[Z", []),  # anything else is ignored
+    ],
+)
+def test_keys(data, keys):
+    assert dashboard.parse_keys(data) == keys
+
+
+def test_sessions_pane_shows_the_sticky_timer():
+    clock = Clock()
+    dash = _dashboard(clock)
+    dash.add(T0, "spend", _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex",
+                                 alias="complex", sticky_left_s=600))
+    clock.now += 70
+    assert "📌 8:50 design-review" in _screen(dash, width=160)
+    assert "📌 8:50" in _screen(dash)  # a narrow terminal shortens the skill name, never the timer
+    # A background call reports the timer without refreshing it; a subagent reports none.
+    dash.add(T0, "spend", _spend(request_type="background", background="title", skill_id="design-review", sticky_left_s=600))
+    dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate"))
+    assert dash.sticky_left("s1") == ("design-review", 530)
+    clock.now += 600
+    assert dash.sticky_left("s1") is None
+
+
+def test_sticky_timer_ends_with_the_route():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(request_type="skill", skill_id="plan", skill_hash="h", tier="complex", sticky_left_s=600))
+    dash.add(T0, "expired", {"skill_id": "plan", "tier": "complex", "why": "idle", "session": "s1"})
+    assert dash.sticky_left("s1") is None
+    dash.add(T0, "spend", _spend(request_type="skill", skill_id="plan", skill_hash="h", tier="complex", sticky_left_s=600))
+    dash.add(T0, "spend", _spend(request_type="skill", unregistered_skill="notes", sticky_left_s=None))
+    assert dash.sticky_left("s1") is None

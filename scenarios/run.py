@@ -46,7 +46,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import check_rules  # noqa: E402
 import dashboard  # noqa: E402
 from report import parse  # noqa: E402
-from watch import pretty_model, tier_text  # noqa: E402
+from events import pretty_model, tier_text  # noqa: E402
 
 GATEWAY = "http://127.0.0.1:4000"
 QUIET_SECONDS = 8  # a suggestion lands a few seconds after the reply

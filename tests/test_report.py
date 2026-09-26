@@ -1,4 +1,4 @@
-"""scripts/report.py: totals from the same log lines the watcher reads."""
+"""scripts/report.py: totals from the same log lines the dashboard reads."""
 import json
 import sys
 import time
