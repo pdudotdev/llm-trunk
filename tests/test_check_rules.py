@@ -60,7 +60,7 @@ def test_a_whole_session_through_the_gateway_breaks_no_rule(gateway, capsys):
     ]
     events = [(T0, "spend", _logged(gateway, data, capsys)) for data in steps]
     result = check_rules.check(events, make_catalog(), TIER_MODELS)
-    assert result == {"checked": len(steps), "skipped": 0, "violations": []}
+    assert result == {"checked": len(steps), "skipped": 0, "catalog_changed": 0, "violations": []}
 
 
 def _event(**fields):
@@ -99,9 +99,22 @@ def test_subagent_that_changes_tier_midway_is_caught():
 
 def test_old_lines_are_skipped_not_judged():
     old = (T0, "spend", {"skill_id": "qa-bug-logging", "alias": "qa-bug-logging", "cost": 0.01})
-    assert check_rules.check([old], make_catalog(), TIER_MODELS) == {"checked": 0, "skipped": 1, "violations": []}
+    assert check_rules.check([old], make_catalog(), TIER_MODELS) == {"checked": 0, "skipped": 1, "catalog_changed": 0, "violations": []}
 
 
 def test_real_config_loads():
     catalog, tier_models = check_rules.load_config()
     assert set(tier_models) >= set(catalog["order"])
+
+
+def test_skill_removed_from_the_catalog_since_is_not_a_violation():
+    # Ran as a registered skill (hash verified), later renamed in the catalog.
+    past = _event(request_type="skill", skill_id="code-review", skill_hash="h", tier="moderate", model="claude-sonnet-5")
+    result = check_rules.check([past], make_catalog(), TIER_MODELS)
+    assert result["violations"] == [] and result["catalog_changed"] == 1 and result["checked"] == 0
+
+
+def test_unregistered_skill_is_still_judged():
+    # No verified hash: a genuinely unregistered skill must still go light.
+    wrong = _event(request_type="skill", unregistered_skill="mine", session_tier="moderate", tier="moderate", model="claude-sonnet-5")
+    assert check_rules.check([wrong], make_catalog(), TIER_MODELS)["violations"]

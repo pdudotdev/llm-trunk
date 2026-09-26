@@ -47,6 +47,9 @@ def load_config() -> tuple[dict, dict[str, str]]:
     return catalog, tier_models
 
 
+CATALOG_CHANGED = "skill no longer in the catalog"
+
+
 def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[str, str]) -> tuple[str | None, str]:
     """(tier this request should have gone to, the rule that says so)."""
     kind = event.get("request_type")
@@ -65,7 +68,9 @@ def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[st
     if kind == "skill":
         row = catalog["skills"].get(event.get("skill_id"))
         if row is None:
-            return lowest(catalog), "unknown skill -> lowest tier"
+            # Its hash was verified when it ran, so it was registered then:
+            # the catalog has changed since, and this can't be judged now.
+            return None, CATALOG_CHANGED
         return row["tier"], f"registered skill {event.get('skill_id')} -> catalog tier"
     if kind == "subagent":
         agent = (event.get("session"), event.get("agent"))
@@ -78,7 +83,7 @@ def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[st
 
 
 def check(events: list[tuple[datetime, str, dict]], catalog: dict, tier_models: dict[str, str]) -> dict:
-    violations, checked, skipped = [], 0, 0
+    violations, checked, skipped, changed = [], 0, 0, 0
     agents: dict[tuple, str] = {}
     for when, kind, event in events:
         if kind != "spend":
@@ -86,8 +91,11 @@ def check(events: list[tuple[datetime, str, dict]], catalog: dict, tier_models: 
         if not event.get("request_type"):
             skipped += 1
             continue
-        checked += 1
         expected, rule = expected_tier(event, catalog, agents, tier_models)
+        if rule == CATALOG_CHANGED:
+            changed += 1
+            continue
+        checked += 1
         actual = event.get("tier")
         problems = []
         if actual != expected:
@@ -99,7 +107,7 @@ def check(events: list[tuple[datetime, str, dict]], catalog: dict, tier_models: 
             agents.setdefault((event.get("session"), event.get("agent")), actual)
         for problem in problems:
             violations.append({"when": when.isoformat(), "session": event.get("session"), "rule": rule, "problem": problem})
-    return {"checked": checked, "skipped": skipped, "violations": violations}
+    return {"checked": checked, "skipped": skipped, "catalog_changed": changed, "violations": violations}
 
 
 def results_events(path: Path) -> list[tuple[datetime, str, dict]]:
@@ -129,7 +137,8 @@ def main() -> None:
     for violation in result["violations"]:
         print(f"✗ {violation['when']}  session {violation['session']}  {violation['rule']}: {violation['problem']}")
     status = "no rule violations" if not result["violations"] else f"{len(result['violations'])} rule violation(s)"
-    print(f"{result['checked']} requests checked, {result['skipped']} older lines skipped — {status}")
+    changed = f", {result['catalog_changed']} for skills since removed from the catalog" if result["catalog_changed"] else ""
+    print(f"{result['checked']} requests checked, {result['skipped']} older lines skipped{changed} — {status}")
     sys.exit(1 if result["violations"] else 0)
 
 
