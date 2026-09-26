@@ -127,7 +127,7 @@ def test_render_shows_savings_types_sessions_and_feed():
     assert "SAVED $0.0" in screen and f"{saved_share:.0%} cheaper than the models Claude Code asked for" in screen
     assert "plan" in screen and "untagged" in screen
     assert "● 3:00" in screen
-    assert "invoked" in screen and "denied" in screen and "Opus 5.5 · low" in screen
+    assert "invoked" in screen and "denied" in screen and "Opus 5.5" in screen and "low" in screen
 
 
 def test_render_before_any_comparable_traffic():
@@ -202,7 +202,7 @@ def test_spend_pane_groups_by_request_type():
     assert set(dash.type_cost) == {"normal", "subagent", "compaction", "background", "skill"}
     screen = _screen(dash)
     assert "spend by request type · vs model asked for" in screen
-    for kind in ("normal", "skill", "subagent", "compaction", "background"):
+    for kind in ("normal", "skill", "subagent", "compaction", "internal"):
         assert kind in screen
 
 
@@ -211,7 +211,24 @@ def test_feed_shows_tier_and_skill():
     dash.add(T0, "spend", _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex", alias="complex"))
     dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate", alias="light"))
     screen = _screen(dash)
-    assert "complex · design-review" in screen and "🤖 subagent" in screen
+    assert "skill (design-review)" in screen and "🤖 subagent" in screen
+
+
+def test_type_names_the_skill_only_for_skill_requests():
+    sticky = _spend(request_type="normal", skill_id="change-review", tier="moderate")
+    title = _spend(request_type="background", background="title", skill_id="change-review")
+    assert dashboard.type_text(_spend(request_type="skill", skill_id="change-review")) == "skill (change-review)"
+    assert dashboard.type_text(_spend(request_type="skill", unregistered_skill="notes")) == "skill (notes)"
+    assert dashboard.type_text(sticky) == "normal"
+    assert dashboard.type_text(title) == "internal"
+
+
+def test_cold_session_names_the_re_cache_cost():
+    clock = Clock()
+    dash = _dashboard(clock)
+    dash.add(T0, "spend", _spend(alias="complex", input_tokens=53_000))
+    clock.now += 301
+    assert "next re-cache costs $0.265" in _screen(dash)
 
 
 def test_session_clock_follows_the_main_conversation_only():

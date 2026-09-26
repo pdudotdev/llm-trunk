@@ -40,9 +40,12 @@ from report import parse  # noqa: E402
 
 from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
 from policy.models import model_key  # noqa: E402
-from watch import ICONS, REPO, STAMP_RE, fmt_tokens, tier_text, pretty_model, request_type_of, route_kind  # noqa: E402
+from watch import ICONS, REPO, STAMP_RE, fmt_tokens, pretty_model, request_type_of, route_kind  # noqa: E402
 
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
+# Request types as the dashboard names them: Claude Code's own housekeeping
+# (titles, suggestions, away summaries, permission checks) reads as "internal".
+TYPE_LABELS = {"background": "internal"}
 FEED_ROWS = 14
 SESSION_ROWS = 6
 
@@ -187,9 +190,17 @@ def _money(value: float) -> str:
     return f"${value:,.3f}" if value < 100 else f"${value:,.0f}"
 
 
-def _model_text(model: str | None, effort: str | None = None) -> Text:
+def _model_text(model: str | None) -> Text:
     name = pretty_model(model) if model else "?"
-    return Text(f"{name} · {effort}" if effort else name, style=MODEL_STYLES.get(name.split(" ")[0], ""))
+    return Text(name, style=MODEL_STYLES.get(name.split(" ")[0], ""))
+
+
+def type_text(event: dict) -> str:
+    """The request type, with the skill's name when the request invoked one."""
+    kind = request_type_of(event)
+    label = TYPE_LABELS.get(kind, kind)
+    skill = event.get("unregistered_skill") or event.get("skill_id")
+    return f"{label} ({skill})" if kind == "skill" and skill else label
 
 
 def vs_asked(saving: float | None) -> Text:
@@ -240,7 +251,7 @@ def types_panel(dash: Dashboard) -> Panel:
             continue
         share = cost / dash.actual if dash.actual else 0
         bar = "█" * round(share * 8)
-        table.add_row(kind, Text(bar.ljust(8), style="cyan"), f"{share:.0%}", _money(cost), vs_asked(dash.type_saving(kind)))
+        table.add_row(TYPE_LABELS.get(kind, kind), Text(bar.ljust(8), style="cyan"), f"{share:.0%}", _money(cost), vs_asked(dash.type_saving(kind)))
     table.add_row("", "", "", "", "")
     hit = dash.cached_tokens / dash.input_tokens if dash.input_tokens else 0
     table.add_row("input from cache", Text(("█" * round(hit * 8)).ljust(8), style="green"), f"{hit:.0%}", "", "")
@@ -263,7 +274,7 @@ def sessions_panel(dash: Dashboard) -> Panel:
         elif warm:
             next_message = Text(f"next {_money(if_warm)} · cold {_money(if_cold)}", style="dim")
         else:
-            next_message = Text(f"next re-caches {_money(if_cold)}", style="red")
+            next_message = Text(f"next re-cache costs {_money(if_cold)}", style="red")
         table.add_row(Text(session, style="bold"), _model_text(state["model"]), status, next_message)
     if not recent:
         table.add_row(Text(f"no activity in the last {_duration(dash.window)}", style="dim"))
@@ -273,8 +284,8 @@ def sessions_panel(dash: Dashboard) -> Panel:
 
 def feed_panel(dash: Dashboard) -> Panel:
     table = Table(box=None, padding=(0, 1), show_edge=False, header_style="dim")
-    for name, justify in (("TIME", "left"), ("ROUTE", "left"), ("TIER · SKILL", "left"), ("MODEL · EFFORT", "left"),
-                          ("INPUT", "right"), ("COST", "right"), ("VS ASKED", "right")):
+    for name, justify in (("TIME", "left"), ("ROUTE", "left"), ("REQ TYPE", "left"), ("TIER", "left"), ("MODEL", "left"),
+                          ("EFFORT", "left"), ("INPUT", "right"), ("COST", "right"), ("VS ASKED", "right")):
         table.add_column(name, justify=justify, no_wrap=True)
     for when, kind, event, saving in dash.feed:
         clock = f"{when:%H:%M:%S}"
@@ -285,10 +296,11 @@ def feed_panel(dash: Dashboard) -> Panel:
             tokens = event.get("input_tokens")
             size = fmt_tokens(tokens) + (" (c)" if tokens and cached * 2 >= tokens else "")
             cost = event.get("cost")
+            effort = event.get("effort")
             table.add_row(
                 Text(clock, style="dim"), Text(label, style="bold" if route == "invoked" else ""),
-                tier_text(event),
-                _model_text(served_model(event, dash.routes, dash.prices), event.get("effort")),
+                type_text(event), event.get("tier") or Text("—", style="dim"),
+                _model_text(served_model(event, dash.routes, dash.prices)), effort or Text("—", style="dim"),
                 size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
             )
         elif kind == "deny":
@@ -296,7 +308,7 @@ def feed_panel(dash: Dashboard) -> Panel:
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['denied']} denied", style="red"), Text(reason[:70], style="red"))
         elif kind == "failed":
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['failed']} failed", style="red"),
-                          tier_text(event), Text(f"upstream {event.get('status') or 'error'}", style="red"))
+                          type_text(event), event.get("tier") or "", Text(f"upstream {event.get('status') or 'error'}", style="red"))
         else:
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['expired']} expired", style="yellow"),
                           Text(f"{event.get('skill_id')} ({event.get('why')}) → back to untagged", style="yellow"))
