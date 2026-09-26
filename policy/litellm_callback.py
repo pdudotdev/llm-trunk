@@ -8,7 +8,7 @@ import yaml
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
-from policy.decide import decide
+from policy.decide import BACKGROUND, COMPACTION, NORMAL, SKILL, SUBAGENT, decide, lowest
 from policy.hash import sha256_hex
 
 
@@ -278,17 +278,33 @@ BACKGROUND_PREFIXES = {
 # text in <session> tags. Both are required -- "no tools" alone would also
 # catch a real turn from Claude Code run with tools disabled.
 TITLE_PREFIX = "<session>"
+# Auto mode's permission classifier (checked on the wire): Claude Code picks
+# its model on purpose, and a weaker one would weaken the safety check, so it
+# passes through untouched.
+PERMISSION_CHECK_MARKER = "You are a security monitor for autonomous AI coding agents"
+# /compact and auto-compaction resend the conversation with this block
+# appended to the newest user turn (checked on the wire).
+COMPACTION_PREFIX = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."
+# Set on every request a subagent makes, one id per subagent.
+AGENT_HEADER = "x-claude-code-agent-id"
+MAX_AGENTS = 1024
+
+
+def _system_text(data: dict) -> str:
+    return _message_text(data.get("system"))
 
 
 def _background_call(data: dict, headers: dict) -> str | None:
     # Claude Code's own housekeeping requests, as opposed to the user's work.
     # They must not count as activity: an away summary would otherwise keep
-    # a sticky route alive, and both would ride (and pay for) its lane.
-    # Only considered for Claude Code traffic. The header is client-settable,
-    # so being classed as background must never grant anything: it only
-    # withholds (timer refreshes, skill invocation, thinking).
+    # a sticky route alive. Only considered for Claude Code traffic. The
+    # header is client-settable, so being classed as background must never
+    # grant anything: it only withholds (timer refreshes, skill invocation,
+    # thinking) or leaves the request as the client sent it.
     if _header(headers, "x-claude-code-session-id") is None:
         return None
+    if not data.get("tools") and PERMISSION_CHECK_MARKER in _system_text(data):
+        return "permission_check"
     last_text = next((block for block in reversed(_latest_user_blocks(data)) if block.strip()), "")
     if not data.get("tools") and last_text.lstrip().startswith(TITLE_PREFIX):
         return "title"
@@ -296,6 +312,31 @@ def _background_call(data: dict, headers: dict) -> str | None:
         if last_text.lstrip().startswith(prefix):
             return kind
     return None
+
+
+def _is_compaction(data: dict, headers: dict) -> bool:
+    # Checked before skills: compaction resends the newest user turn, so the
+    # turn it compacts may itself be a skill invocation. Compaction is exempt
+    # from the input cap, so like background calls it needs the Claude Code
+    # header; the key's budget cap is the backstop against a forged one.
+    if _header(headers, "x-claude-code-session-id") is None:
+        return False
+    last_text = next((block for block in reversed(_latest_user_blocks(data)) if block.strip()), "")
+    return last_text.lstrip().startswith(COMPACTION_PREFIX) and "<summary>" in last_text
+
+
+def _invoked_skill_name(blocks: list[str], tool_names: list[str]) -> str | None:
+    """The name of a skill invoked this turn, registered or not.
+
+    A skill arrives with its "Base directory for this skill" block; built-in
+    commands such as /model or /compact never do, so they don't count."""
+    if not any(BASE_DIR_RE.search(block) for block in blocks):
+        return None
+    for block in blocks:
+        match = COMMAND_NAME_RE.search(block)
+        if match:
+            return match.group("name")
+    return tool_names[0] if tool_names else "unknown"
 
 
 def _claude_code_session_id(data: dict) -> str | None:
@@ -316,8 +357,10 @@ def _claude_code_session_id(data: dict) -> str | None:
 class SkillRoutingCallback(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
-        # session_key -> (skill_id, first_invoked_at, last_used_at)
-        self._sticky: OrderedDict[str, tuple[str, float, float]] = OrderedDict()
+        # session_key -> (tier, skill_id, first_invoked_at, last_used_at)
+        self._sticky: OrderedDict[str, tuple[str, str, float, float]] = OrderedDict()
+        # (session_key, agent id) -> tier: a subagent keeps its tier (and cache)
+        self._agents: OrderedDict[tuple[str, str], str] = OrderedDict()
 
     def _session_key(self, user_api_key_dict, data: dict, headers: dict) -> str:
         key = (
@@ -349,15 +392,16 @@ class SkillRoutingCallback(CustomLogger):
         return f"{key}:{conversation}"
 
     @staticmethod
-    def _sticky_deadline(entry: tuple[str, float, float]) -> tuple[float, str]:
+    def _sticky_deadline(entry: tuple[str, str, float, float]) -> tuple[float, str]:
         # When (monotonic) a route stops sticking, and which timer ends it:
         # idle since the last real turn, or max age since the last invocation.
-        _, first_invoked_at, last_used_at = entry
+        _, _, first_invoked_at, last_used_at = entry
         idle = last_used_at + STICKY_IDLE_TIMEOUT_SECONDS
         max_age = first_invoked_at + STICKY_MAX_AGE_SECONDS
         return (idle, "idle") if idle <= max_age else (max_age, "max-age")
 
-    def _get_sticky(self, session_key: str) -> str | None:
+    def _get_sticky(self, session_key: str) -> tuple[str, str] | None:
+        """(tier, skill_id) of the conversation's live route, if any."""
         entry = self._sticky.get(session_key)
         if entry is None:
             return None
@@ -366,16 +410,16 @@ class SkillRoutingCallback(CustomLogger):
             del self._sticky[session_key]
             _log_event(
                 "expired",
-                {"skill_id": entry[0], "why": why, "session": _short_session(session_key)},
+                {"skill_id": entry[1], "tier": entry[0], "why": why, "session": _short_session(session_key)},
             )
             return None
-        return entry[0]
+        return entry[0], entry[1]
 
-    def _touch_sticky(self, session_key: str, skill_id: str, *, reinvoked: bool) -> None:
+    def _touch_sticky(self, session_key: str, tier: str, skill_id: str, *, reinvoked: bool) -> None:
         now = time.monotonic()
         existing = self._sticky.get(session_key)
-        first_invoked_at = now if (reinvoked or existing is None) else existing[1]
-        self._sticky[session_key] = (skill_id, first_invoked_at, now)
+        first_invoked_at = now if (reinvoked or existing is None) else existing[2]
+        self._sticky[session_key] = (tier, skill_id, first_invoked_at, now)
         self._sticky.move_to_end(session_key)
         while len(self._sticky) > MAX_STICKY_SESSIONS:
             self._sticky.popitem(last=False)
@@ -388,6 +432,12 @@ class SkillRoutingCallback(CustomLogger):
             return None
         deadline, _ = self._sticky_deadline(entry)
         return time.time() + (deadline - time.monotonic())
+
+    def _remember_agent(self, agent_key: tuple[str, str], tier: str) -> None:
+        self._agents[agent_key] = tier
+        self._agents.move_to_end(agent_key)
+        while len(self._agents) > MAX_AGENTS:
+            self._agents.popitem(last=False)
 
     def _headers_trusted(self, user_api_key_dict) -> bool:
         # x-skill-id/x-skill-hash are a self-asserted claim: the hash proves
@@ -409,22 +459,55 @@ class SkillRoutingCallback(CustomLogger):
         # forged by anyone who can read a skill file (it's not a secret), so
         # trusting a *claim* -- however it was resolved, headers or a forged
         # <command-name> block -- was never going to work. This checks who is
-        # actually allowed to *reach* each lane, after extraction, before
-        # decide() ever sees the claim. A key without this metadata field is
-        # unrestricted (today's qa-usage key: it legitimately needs every
-        # skill, so there is nothing to allow-list yet). `untagged` is never
-        # restricted -- there is nothing to protect by blocking the cheap
-        # default lane.
+        # actually allowed to *reach* each skill's tier, after extraction,
+        # before decide() ever sees the claim. A key without this metadata
+        # field is unrestricted. A skill a key may not use is routed like an
+        # unregistered one: to the lowest tier.
         metadata = getattr(user_api_key_dict, "metadata", None) or {}
         if "allowed_skills" not in metadata:
             return None
         allowed = metadata["allowed_skills"]
         if isinstance(allowed, list) and all(isinstance(skill, str) for skill in allowed):
             return set(allowed)
-        # Present but malformed (e.g. a bare string): fail closed to
-        # untagged-only rather than silently treating the key as unrestricted.
-        _log(f"llm-trunk: malformed allowed_skills {allowed!r}; key restricted to untagged")
+        # Present but malformed (e.g. a bare string): fail closed to the
+        # lowest tier rather than silently treating the key as unrestricted.
+        _log(f"llm-trunk: malformed allowed_skills {allowed!r}; key restricted to the lowest tier")
         return set()
+
+    def _classify(self, data: dict, headers: dict, catalog: dict, user_api_key_dict) -> dict:
+        """What this request is: request type plus the facts routing needs."""
+        agent_id = _header(headers, AGENT_HEADER)
+        if agent_id:
+            # A subagent's own skill invocations don't lift it above its tier.
+            return {"request_type": SUBAGENT, "agent_id": agent_id}
+        if _is_compaction(data, headers):
+            return {"request_type": COMPACTION}
+        background = _background_call(data, headers)
+        if background:
+            return {"request_type": BACKGROUND, "background": background}
+
+        skill_id = skill_hash = None
+        if self._headers_trusted(user_api_key_dict):
+            skill_id, skill_hash = headers.get("x-skill-id"), headers.get("x-skill-hash")
+        # An id without a hash is an unverified client claim, so both headers
+        # are required together; otherwise fall through to body extraction,
+        # scoped to only the newest user turn (see _latest_user_blocks).
+        if not (skill_id and skill_hash):
+            skill_id = skill_hash = None
+            blocks, tool_names = _latest_user_blocks(data), _skill_tool_names(data)
+            extracted = _extract_skill(blocks, catalog, tool_names)
+            if extracted:
+                skill_id, skill_hash = extracted
+            else:
+                unregistered = _invoked_skill_name(blocks, tool_names)
+                if unregistered:
+                    return {"request_type": SKILL, "registered": False, "skill_name": unregistered}
+        if skill_id is None:
+            return {"request_type": NORMAL}
+        allowed = self._allowed_skills(user_api_key_dict)
+        if allowed is not None and skill_id not in allowed:
+            return {"request_type": SKILL, "registered": False, "skill_name": skill_id}
+        return {"request_type": SKILL, "registered": True, "skill_id": skill_id, "skill_hash": skill_hash}
 
     async def async_pre_call_hook(
         self, user_api_key_dict, cache, data: dict, call_type: str
@@ -434,41 +517,49 @@ class SkillRoutingCallback(CustomLogger):
         # not the "metadata" key some older docs/examples reference.
         headers = data.get("litellm_metadata", {}).get("headers", {}) or {}
         session_key = self._session_key(user_api_key_dict, data, headers)
-        background = _background_call(data, headers)
+        request = self._classify(data, headers, catalog, user_api_key_dict)
+        request_type, background = request["request_type"], request.get("background")
+        # The model Claude Code asked for, before the tier replaces it: the
+        # baseline for "what would this have cost without llm-trunk".
+        requested_model = data.get("model")
 
-        skill_id = skill_hash = None
-        if background is None and self._headers_trusted(user_api_key_dict):
-            skill_id = headers.get("x-skill-id")
-            skill_hash = headers.get("x-skill-hash")
+        sticky = self._get_sticky(session_key)
+        allowed = self._allowed_skills(user_api_key_dict)
+        if sticky is not None and allowed is not None and sticky[1] not in allowed:
+            sticky = None
+        session_tier = sticky[0] if sticky else None
+        agent_key = (session_key, request.get("agent_id") or "")
+        routing = {
+            "skill_id": request.get("skill_id") or (sticky[1] if sticky and request_type != SUBAGENT else None),
+            "skill_hash": request.get("skill_hash"),
+            "request_type": request_type,
+            "session_tier": session_tier or lowest(catalog),
+            "estimated_input_tokens": _estimate_input_tokens(data),
+            "session": _short_session(session_key),
+            "background": background,
+            "requested_model": requested_model,
+            "agent": (request.get("agent_id") or "")[:8] or None,
+            "unregistered_skill": request.get("skill_name"),
+        }
 
-        # An id without a hash is an unverified client claim, so both headers
-        # are required together; otherwise fall through to body extraction,
-        # scoped to only the newest user turn (see _latest_user_blocks).
-        # Background calls never invoke a skill (a title prompt quotes the
-        # user's first message, which may itself be an invocation).
-        if background is None and not (skill_id and skill_hash):
-            skill_id = skill_hash = None
-            extracted = _extract_skill(
-                _latest_user_blocks(data), catalog, _skill_tool_names(data)
-            )
-            if extracted:
-                skill_id, skill_hash = extracted
+        if background == "permission_check":
+            # Passed through as sent: model, effort and limits are Claude Code's.
+            data.setdefault("litellm_metadata", {})["skill_routing"] = {
+                **routing, "skill_id": None, "alias": requested_model, "tier": None, "effort": None, "sticky_expires_at": None,
+            }
+            return data
 
-        # Background calls ride the session's current lane (untagged if it has
-        # none): recaps and suggestions carry the whole conversation, already
-        # cached on that lane's model, and moving them would re-send it uncached.
-        sticky_skill_id = self._get_sticky(session_key)
-
-        allowed_skills = self._allowed_skills(user_api_key_dict)
-        if allowed_skills is not None:
-            if skill_id is not None and skill_id not in allowed_skills:
-                skill_id = skill_hash = None
-            if sticky_skill_id is not None and sticky_skill_id not in allowed_skills:
-                sticky_skill_id = None
-
-        estimated_input_tokens = _estimate_input_tokens(data)
-
-        decision = decide(catalog, skill_id, skill_hash, sticky_skill_id, estimated_input_tokens)
+        decision = decide(
+            catalog,
+            request_type,
+            routing["estimated_input_tokens"],
+            # A title is ~1k tokens with nothing cached: the lowest tier is free savings.
+            session_tier=None if background == "title" else session_tier,
+            skill_id=request.get("skill_id"),
+            skill_hash=request.get("skill_hash"),
+            registered=request.get("registered", False),
+            agent_tier=self._agents.get(agent_key),
+        )
 
         if decision.action == "deny":
             _log_event(
@@ -476,32 +567,36 @@ class SkillRoutingCallback(CustomLogger):
                 {
                     "code": decision.code,
                     "reason": decision.reason,
-                    "session": _short_session(session_key),
+                    "session": routing["session"],
                     "background": background,
+                    "request_type": request_type,
                 },
             )
             raise HTTPException(status_code=DENY_STATUS, detail=decision.reason)
 
-        effective_skill_id = skill_id or sticky_skill_id
-        # Only the user's own turns count as activity for the sticky timers.
-        if effective_skill_id is not None and background is None:
-            self._touch_sticky(session_key, effective_skill_id, reinvoked=skill_id is not None)
+        # Only the user's own turns move the sticky route.
+        if request_type == SKILL and request.get("registered"):
+            self._touch_sticky(session_key, decision.tier, request["skill_id"], reinvoked=True)
+        elif request_type == SKILL:
+            # An unregistered skill drops the conversation to the lowest tier,
+            # and its follow-ups stay there.
+            self._sticky.pop(session_key, None)
+        elif request_type == NORMAL and sticky is not None:
+            self._touch_sticky(session_key, sticky[0], sticky[1], reinvoked=False)
+        elif request_type == SUBAGENT:
+            self._remember_agent(agent_key, decision.tier)
 
-        # The model Claude Code asked for, before the lane replaces it: the
-        # baseline for "what would this have cost without llm-trunk".
-        requested_model = data.get("model")
-        data["model"] = decision.alias
+        data["model"] = decision.tier
         # Claude Code sends its own `thinking` + `output_config.effort` (the
         # user's /effort), and LiteLLM lets caller-supplied values win over
-        # `reasoning_effort` -- left in place, the lane's effort is silently
+        # `reasoning_effort` -- left in place, the tier's effort is silently
         # ignored. Drop the client's; LiteLLM then maps ours per model
         # (adaptive thinking + effort on Opus/Sonnet 5, a thinking budget on
-        # Haiku 4.5). A title gets no thinking at all: the lane's effort
+        # Haiku 4.5). A title gets no thinking at all: the tier's effort
         # turned thinking on for a request that asked for none, and keeping a
         # client's own budget could exceed the capped max_tokens (a 400).
-        # Recaps and suggestions do get the lane's effort -- Anthropic's
-        # prompt cache doesn't match across thinking settings, and with their
-        # own they re-sent the whole conversation uncached (live: 0 of 54k).
+        # Suggestions, recaps and compaction do get the tier's effort --
+        # Anthropic's prompt cache doesn't match across thinking settings.
         data.pop("thinking", None)
         output_config = data.get("output_config")
         if isinstance(output_config, dict):
@@ -517,16 +612,14 @@ class SkillRoutingCallback(CustomLogger):
             min(requested_max, decision.max_output) if requested_max else decision.max_output
         )
 
+        live = self._sticky.get(session_key)
         data.setdefault("litellm_metadata", {})["skill_routing"] = {
-            "skill_id": effective_skill_id,
-            "skill_hash": skill_hash,
-            "alias": decision.alias,
+            **routing,
+            "skill_id": routing["skill_id"] if live or request_type == SKILL else None,
+            "alias": decision.tier,
+            "tier": decision.tier,
             "effort": None if background == "title" else decision.effort,
-            "estimated_input_tokens": estimated_input_tokens,
-            "session": _short_session(session_key),
-            "sticky_expires_at": self._sticky_expires_at(session_key) if effective_skill_id else None,
-            "background": background,
-            "requested_model": requested_model,
+            "sticky_expires_at": self._sticky_expires_at(session_key) if live and request_type != SUBAGENT else None,
         }
         return data
 
@@ -547,6 +640,11 @@ class SkillRoutingCallback(CustomLogger):
             "sticky_left_s": max(0, int(expires_at - time.time())) if expires_at else None,
             "background": routing.get("background"),
             "requested_model": routing.get("requested_model"),
+            "request_type": routing.get("request_type"),
+            "tier": routing.get("tier"),
+            "session_tier": routing.get("session_tier"),
+            "agent": routing.get("agent"),
+            "unregistered_skill": routing.get("unregistered_skill"),
         }
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:

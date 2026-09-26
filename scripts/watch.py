@@ -35,6 +35,7 @@ SESSION_COLORS = ["36", "33", "35", "32", "34", "96", "93", "95"]
 # Each icon is a single wide (2-cell) code point, so columns stay aligned.
 ICONS = {
     "invoked": "🔖", "sticky": "📌", "untagged": "⚪",
+    "unregistered": "🔹", "subagent": "🤖", "compaction": "🧹", "passthrough": "🔒",
     "denied": "⛔", "failed": "❌", "expired": "⏳",
 }
 
@@ -44,7 +45,7 @@ COLUMNS = [
     ("SESSION", 8, False),
     ("ROUTE", 15, False),
     ("MODEL · EFFORT", 18, False),
-    ("LANE", 22, False),
+    ("TIER · SKILL", 22, False),
     ("STICKY", 8, True),
     ("INPUT", 9, True),
     ("COST", 7, True),
@@ -72,6 +73,16 @@ def pretty_model(model_id: str) -> str:
     if not match:
         return name
     return f"{match.group(1).capitalize()} {match.group(2).replace('-', '.')}"
+
+
+def model_key(model: str | None) -> str | None:
+    """Any spelling of a Claude model id -> the key used in pricing.yaml."""
+    if not model:
+        return None
+    name = model.lower().split("/")[-1].replace("[1m]", "")
+    name = re.sub(r"^(?:[a-z-]+\.)?anthropic\.", "", name)  # Bedrock: us.anthropic.claude-...
+    name = re.sub(r"-v\d+(?::\d+)?$", "", name)  # Bedrock: ...-v1:0
+    return re.sub(r"-\d{8}$", "", name)  # dated snapshot: ...-20251001
 
 
 def load_models() -> dict[str, str]:
@@ -131,18 +142,52 @@ def fmt_left(seconds: int | None) -> str:
 
 
 def route_kind(event: dict) -> str:
+    # Events logged before request types existed have no request_type.
+    request_type = event.get("request_type")
+    if request_type == "subagent":
+        return "subagent"
+    if request_type == "compaction":
+        return "compaction"
+    if event.get("background") == "permission_check":
+        return "passthrough"
+    if request_type == "skill" and event.get("unregistered_skill"):
+        return "unregistered"
     if event.get("skill_id") is None:
         return "untagged"
     return "invoked" if event.get("skill_hash") else "sticky"
 
 
+def request_type_of(event: dict) -> str:
+    """normal / skill / subagent / compaction / background; events logged
+    before request types existed are classified from what they do carry."""
+    if event.get("request_type"):
+        return event["request_type"]
+    if event.get("background"):
+        return "background"
+    return "skill" if event.get("skill_hash") else "normal"
+
+
+def lane_text(event: dict) -> str:
+    """Where the request went: the tier, plus the skill that put it there."""
+    if event.get("background") == "permission_check":
+        return "passed through"
+    tier = event.get("tier")
+    skill = event.get("unregistered_skill") or event.get("skill_id")
+    if not tier:
+        # Old events (per-skill lanes), or a passed-through request.
+        return skill or "untagged"
+    return f"{tier} · {skill}" if skill else tier
+
+
 def model_cells(event: dict, models: dict[str, str]) -> list[str]:
     alias = event.get("alias") or "?"
-    model = models.get(alias, alias)
+    model = models.get(alias) or pretty_model(alias)  # a passed-through request carries a model id
     text = f"{model} · {event['effort']}" if event.get("effort") else model
+    _, width, _ = COLUMNS[4]
+    lane = lane_text(event)
     return [
         cell(3, text, MODEL_COLORS.get(model.split(" ")[0])),
-        cell(4, event.get("skill_id") or "untagged"),
+        cell(4, lane if len(lane) <= width else lane[: width - 1] + "…"),
     ]
 
 
@@ -190,7 +235,7 @@ def render(message: str, clock: str, models: dict[str, str]) -> str | None:
 
 
 def header() -> str:
-    legend = "   ".join(f"{icon} {kind}" for kind, icon in ICONS.items()) + "   (i) Claude Code background call   (c) cached input"
+    legend = "   ".join(f"{icon} {kind}" for kind, icon in ICONS.items()) + "   (i) background call   (c) cached input"
     columns = GAP.join(
         name.rjust(width) if right else name.ljust(width) for name, width, right in COLUMNS
     )

@@ -53,43 +53,32 @@ from policy import litellm_callback as cb  # noqa: E402
 
 HTTPException = sys.modules["fastapi"].HTTPException
 
-# Synthetic skills: the tests don't depend on the real skill files (those are
-# checked separately in test_catalog.py).
+# Synthetic skills, one per tier: the tests don't depend on the real skill
+# files (those are checked separately in test_catalog.py).
 BODIES = {
-    "plan": "# Test plan\nWrite a test plan for the feature under test.\n",
-    "verify": "# Fix verification\nRe-run the failing case and report pass or fail.\n",
+    "plan": "# Design review\nReview the proposed design and list its risks.\n",
+    "review": "# Code review\nReview the change for bugs and missing tests.\n",
+    "verify": "# Commit message\nWrite a short commit message for the change.\n",
 }
-UNTAGGED_CAP = 64000
-
-
-def _row(body: str, alias: str, effort: str, max_input: int, max_output: int) -> dict:
-    raw = body.encode()
-    return {
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "bytes": len(raw),
-        "alias": alias,
-        "vendor": "anthropic",
-        "effort": effort,
-        "max_input": max_input,
-        "max_output": max_output,
-    }
+TIERS = {"plan": "complex", "review": "moderate", "verify": "light"}
+LIGHT_CAP = 64000
 
 
 def make_catalog() -> dict:
-    return {
-        "version": 1,
-        "untagged": {
-            "alias": "untagged",
-            "vendor": "anthropic",
-            "effort": "low",
-            "max_input": UNTAGGED_CAP,
-            "max_output": 4000,
+    catalog = {
+        "version": 2,
+        "order": ["light", "moderate", "complex"],
+        "tiers": {
+            "light": {"vendor": "anthropic", "effort": "low", "max_input": LIGHT_CAP, "max_output": 4000},
+            "moderate": {"vendor": "anthropic", "effort": "medium", "max_input": 128000, "max_output": 4000},
+            "complex": {"vendor": "anthropic", "effort": "high", "max_input": 180000, "max_output": 8000},
         },
-        "skills": {
-            "plan": _row(BODIES["plan"], "plan-lane", "high", 180000, 8000),
-            "verify": _row(BODIES["verify"], "verify-lane", "low", 64000, 2000),
-        },
+        "skills": {},
     }
+    for name, body in BODIES.items():
+        raw = body.encode()
+        catalog["skills"][name] = {"tier": TIERS[name], "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    return catalog
 
 
 @pytest.fixture
@@ -185,3 +174,38 @@ def request(*messages: dict, session: str = "session-1", tools: bool = True, cla
 
 def routing(data: dict) -> dict:
     return data["litellm_metadata"]["skill_routing"]
+
+
+def unregistered_turn(name: str = "personal-notes", arguments: str = "rotate the keys on friday") -> dict:
+    """An invoked skill that isn't in the catalog: same shape as a registered one."""
+    return skill_turn(name, body="A personal skill that isn't in the catalog.\n", arguments=arguments)
+
+
+def subagent_request(agent_id: str = "a02164c76a605652b", *messages: dict, session: str = "session-1") -> dict:
+    data = request(*(messages or (user("List the folders in .claude/skills."),)), session=session)
+    data["system"] = [{"type": "text", "text": "x-anthropic-billing-header: cc_is_subagent=true;"},
+                      {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."}]
+    data["litellm_metadata"]["headers"]["x-claude-code-agent-id"] = agent_id
+    return data
+
+
+COMPACTION_INSTRUCTION = (
+    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary "
+    "of the conversation so far, followed by a <summary> block. Tool calls will be rejected and you will fail the task."
+)
+
+
+def compaction_request(*history: dict, session: str = "session-1", **extra) -> dict:
+    """Compaction resends the conversation, appending its instruction to the newest user turn."""
+    history = list(history)
+    last = dict(history[-1])
+    last["content"] = list(last["content"]) + [{"type": "text", "text": COMPACTION_INSTRUCTION}]
+    return request(*history[:-1], last, session=session, **extra)
+
+
+def permission_check_request(session: str = "session-1") -> dict:
+    data = request(user("<transcript>\n{\"user\":\"list the folders\"}\n</transcript>"), session=session, tools=False)
+    data["model"] = "claude-sonnet-5"
+    data["max_tokens"] = 64
+    data["system"] = [{"type": "text", "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"}]
+    return data

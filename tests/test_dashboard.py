@@ -93,7 +93,7 @@ def test_dashboard_totals_and_savings():
     assert 2 < ratio < 3
     assert dash.compared_without == pytest.approx(0.0068 * ratio + 0.05)
     assert dash.saved == pytest.approx(0.0068 * (ratio - 1))
-    assert dash.lane_cost["plan"] == pytest.approx(0.05)
+    assert dash.type_cost["skill"] == pytest.approx(0.05)
 
 
 def test_cache_clock_warm_then_cold():
@@ -143,16 +143,16 @@ def test_vs_asked_labels(saving, text):
     assert dashboard.vs_asked(saving).plain == text
 
 
-def test_lane_that_costs_more_than_asked_is_flagged():
+def test_type_that_costs_more_than_asked_is_flagged():
     # What the live run found: Claude Code asked for Opus 5.5, the plan lane ran Opus 5.
     routes = {**ROUTES, "plan-lane": "anthropic/claude-opus-5"}
     dash = dashboard.Dashboard(PRICES, routes, 300, Clock())
     dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05, cache_read_tokens=0))
     assert dash.saved < 0
-    assert dash.lane_saving("plan") == pytest.approx(-0.25)  # Opus 5 is 25% pricier on uncached tokens
+    assert dash.type_saving("skill") == pytest.approx(-0.25)  # Opus 5 is 25% pricier on uncached tokens
     screen = _screen(dash)
     assert "COSTING $" in screen and "MORE" in screen
-    assert "⚠ +25% cost" in screen  # in the lane panel and the feed
+    assert "⚠ +25% cost" in screen  # in the request-type panel and the feed
 
 
 def test_logged_model_wins_over_current_lane_config():
@@ -160,7 +160,7 @@ def test_logged_model_wins_over_current_lane_config():
     dash = _dashboard()  # ROUTES now point plan-lane at Opus 5.5
     dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", alias="plan-lane", cost=0.05,
                                  cache_read_tokens=0, model="claude-opus-5-20260101"))
-    assert dash.lane_saving("plan") == pytest.approx(-0.25)
+    assert dash.type_saving("skill") == pytest.approx(-0.25)
     assert dash.sessions["s1"]["model"] == "claude-opus-5-20260101"
 
 
@@ -189,3 +189,25 @@ def test_warm_session_line_is_not_truncated():
     dash.add(T0, "spend", _spend(alias="plan-lane", input_tokens=53_000))
     screen = _screen(dash)
     assert "next $0.011 · cold $0.265" in screen
+
+
+def test_spend_pane_groups_by_request_type():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(request_type="normal"))
+    dash.add(T0, "spend", _spend(request_type="subagent", cost=0.02))
+    dash.add(T0, "spend", _spend(request_type="compaction", cost=0.01))
+    dash.add(T0, "spend", _spend(background="prompt_suggestion", cost=0.003))  # old line: no request_type
+    dash.add(T0, "spend", _spend(skill_id="plan", skill_hash="h", cost=0.04))  # old line: an invocation
+    assert set(dash.type_cost) == {"normal", "subagent", "compaction", "background", "skill"}
+    screen = _screen(dash)
+    assert "spend by request type · vs model asked for" in screen
+    for kind in ("normal", "skill", "subagent", "compaction", "background"):
+        assert kind in screen
+
+
+def test_feed_shows_tier_and_skill():
+    dash = _dashboard()
+    dash.add(T0, "spend", _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex", alias="plan-lane"))
+    dash.add(T0, "spend", _spend(request_type="subagent", tier="moderate", alias="untagged"))
+    screen = _screen(dash)
+    assert "complex · design-review" in screen and "🤖 subagent" in screen

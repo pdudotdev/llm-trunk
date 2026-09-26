@@ -11,27 +11,35 @@ sys.path.insert(0, str(REPO / "scenarios"))
 import run  # noqa: E402
 
 PRICES = run.dashboard.load_prices()
-ROUTES = {"qa-test-plan-creation": "anthropic/claude-opus-5-5", "untagged": "anthropic/claude-haiku-4-5"}
+ROUTES = {"complex": "anthropic/claude-opus-5-5", "moderate": "anthropic/claude-sonnet-5", "light": "anthropic/claude-haiku-4-5"}
 STEPS = [
-    {"name": "plain question", "type": "normal", "send": "In one sentence: what is a regression test?"},
-    {"name": "test plan", "type": "skill", "send": "/qa-test-plan-creation Password reset by email link.", "expect": "[DEMO TEST PLAN]"},
+    {"name": "plain question", "type": "normal", "tier": "light", "send": "In one sentence: what is a regression test?"},
+    {"name": "design review", "type": "skill", "tier": "complex", "send": "/design-review Password reset by email link.", "expect": "[DEMO DESIGN REVIEW]"},
     {"name": "idle", "type": "idle", "wait_seconds": 330},
+    {"name": "subagent", "type": "subagent", "tier": "moderate", "send": "Use a subagent to list the folders."},
 ]
 
 
-def test_qa_day_scenario_is_valid():
-    scenario = run.load(REPO / "scenarios" / "qa-day.yaml")
-    types = {step["type"] for step in scenario["steps"]}
-    assert {"normal", "skill", "subagent", "compaction", "idle"} <= types
-    skills = {step["send"].split()[0][1:] for step in scenario["steps"] if step["type"] == "skill"}
+def test_dev_day_scenario_covers_every_type_skill_and_tier():
+    scenario = run.load(REPO / "scenarios" / "dev-day.yaml")
     catalog = __import__("yaml").safe_load((REPO / "catalog.yaml").read_text())
-    assert skills == set(catalog["skills"])  # every catalog skill is exercised
+    steps = scenario["steps"]
+    assert {"normal", "skill", "subagent", "compaction", "idle"} <= {step["type"] for step in steps}
+    invoked = {step["send"].split()[0][1:] for step in steps if step["type"] == "skill"}
+    assert set(catalog["skills"]) <= invoked  # every registered skill is exercised...
+    assert invoked - set(catalog["skills"])  # ...and at least one unregistered one
+    tiers = {step["tier"] for step in steps if step["type"] != "idle"}
+    assert tiers == set(catalog["order"])  # every tier is reached
+    for step in steps:
+        if step["type"] == "skill" and step["send"].split()[0][1:] in catalog["skills"]:
+            assert step["tier"] == catalog["skills"][step["send"].split()[0][1:]]["tier"], step["name"]
 
 
 def test_dry_run_lists_steps_without_sending():
     result = subprocess.run([sys.executable, str(REPO / "scenarios" / "run.py"), "--dry-run"], capture_output=True, text=True, check=True)
     assert " 1. [normal] plain question" in result.stdout
     assert "[idle] idle past the cache: wait 330 s" in result.stdout
+    assert "/personal-notes" in result.stdout
 
 
 def test_answer_and_quiet_on_the_gateway():
@@ -87,7 +95,7 @@ def test_read_records_skips_a_half_written_last_line(tmp_path):
 
 
 def _spend(**fields):
-    base = {"skill_id": None, "alias": "untagged", "session": "abcd1234", "input_tokens": 40_000,
+    base = {"skill_id": None, "alias": "light", "tier": "light", "request_type": "normal", "session": "abcd1234", "input_tokens": 40_000,
             "cache_read_tokens": 0, "cache_write_tokens": 40_000, "output_tokens": 100, "cost": 0.0505,
             "requested_model": "claude-opus-5-5", "model": "claude-haiku-4-5-20251001", "background": None}
     return {**base, **fields}
@@ -96,17 +104,31 @@ def _spend(**fields):
 def test_summarize_groups_events_by_step():
     collected = [
         (1.0, "spend", _spend(), 0),
-        (2.0, "spend", _spend(background="title", cost=0.001, input_tokens=900, cache_write_tokens=0), 0),
-        (3.0, "spend", _spend(skill_id="qa-test-plan-creation", alias="qa-test-plan-creation",
+        (2.0, "spend", _spend(request_type="background", background="title", cost=0.001, input_tokens=900, cache_write_tokens=0), 0),
+        (3.0, "spend", _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex", alias="complex",
                               model="claude-opus-5-5", cost=0.27), 1),
+        (4.0, "spend", _spend(request_type="normal", skill_id="design-review", tier="complex", alias="complex",
+                              model="claude-opus-5-5", cost=0.02), 3),  # the turn that launched the subagent
+        (5.0, "spend", _spend(request_type="subagent", tier="moderate", alias="moderate", model="claude-sonnet-5", cost=0.03), 3),
     ]
     rows = run.summarize(STEPS, collected, PRICES, ROUTES)
     assert rows[0]["requests"] == 2 and rows[0]["background"] == 1
-    assert rows[0]["routes"] == ["untagged → Haiku 4.5"]
+    assert rows[0]["routes"] == ["light → Haiku 4.5"] and rows[0]["tier_ok"] is True
     assert rows[0]["without"] == pytest.approx((0.0505 + 0.001) * 4)  # Opus 5.5 is 4x Haiku here
-    assert rows[1]["routes"] == ["qa-test-plan-creation → Opus 5.5"]
-    assert rows[1]["without"] == pytest.approx(0.27)  # lane runs the model asked for
-    assert rows[2]["requests"] == 0 and not rows[2]["comparable"]
+    assert rows[1]["routes"] == ["complex · design-review → Opus 5.5"] and rows[1]["tier_ok"] is True
+    assert rows[1]["without"] == pytest.approx(0.27)  # the tier runs the model asked for
+    assert rows[2]["requests"] == 0 and not rows[2]["comparable"] and rows[2]["tier_ok"] is None
+    assert rows[3]["routes"] == ["moderate → Sonnet 5"] and rows[3]["tier_ok"] is True  # judged on the subagent's requests
+
+
+def test_step_on_the_wrong_tier_is_flagged():
+    collected = [(1.0, "spend", _spend(tier="moderate", alias="moderate", model="claude-sonnet-5"), 0)]
+    assert run.summarize(STEPS[:1], collected, PRICES, ROUTES)[0]["tier_ok"] is False
+
+
+def test_step_without_its_main_request_is_flagged():
+    collected = [(1.0, "spend", _spend(request_type="background", background="title"), 0)]
+    assert run.summarize(STEPS[:1], collected, PRICES, ROUTES)[0]["tier_ok"] is False
 
 
 def _transcript(tmp_path, entries):
@@ -119,11 +141,11 @@ def test_check_answers_from_transcript(tmp_path):
     path = _transcript(tmp_path, [
         ("user", "In one sentence: what is a regression test?"),
         ("assistant", [{"type": "text", "text": "A test that checks old behavior still works."}]),
-        ("user", "<command-name>/qa-test-plan-creation</command-name>\n<command-args>Password reset by email link.</command-args>"),
+        ("user", "<command-name>/design-review</command-name>\n<command-args>Password reset by email link.</command-args>"),
         ("user", [{"type": "text", "text": "Base directory for this skill: ..."}]),
-        ("assistant", [{"type": "text", "text": "[DEMO TEST PLAN]\n**Scope**: ..."}]),
+        ("assistant", [{"type": "text", "text": "[DEMO DESIGN REVIEW]\n**Summary**: ..."}]),
     ])
-    assert run.check_answers(STEPS, run.transcript_entries(path)) == [None, "PASS", None]
+    assert run.check_answers(STEPS, run.transcript_entries(path)) == [None, "PASS", None, None]
 
 
 def test_check_answers_fail_and_missing(tmp_path):

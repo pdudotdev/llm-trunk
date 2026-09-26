@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run a scripted Claude Code session through llm-trunk and report each step.
 
-    python3 scenarios/run.py                  # scenarios/qa-day.yaml
+    python3 scenarios/run.py                  # scenarios/dev-day.yaml
     python3 scenarios/run.py --quick          # skip idle steps
+    python3 scenarios/run.py --cold-start     # first wait until the prompt cache is cold
     python3 scenarios/run.py --dry-run        # list the steps, send nothing
 
 Drives a real, interactive Claude Code session in the client repo (so it
@@ -13,7 +14,10 @@ Afterwards it prints what each step cost, what it would have cost on the
 model Claude Code asked for, and whether the answer passed its check, and
 saves the raw events to scenarios/results/.
 
-Costs real money on the gateway's API key (about $1-2 for qa-day).
+Every step is also checked for the tier its main request should reach, and
+the whole session is run through scripts/check_rules.py.
+
+Costs real money on the gateway's API key (about $1-2 for dev-day).
 Keep the dashboard open next to it to watch the run live.
 """
 import argparse
@@ -38,13 +42,16 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
+import check_rules  # noqa: E402
 import dashboard  # noqa: E402
-from watch import pretty_model  # noqa: E402
+from report import parse  # noqa: E402
+from watch import lane_text, pretty_model  # noqa: E402
 
 GATEWAY = "http://127.0.0.1:4000"
 QUIET_SECONDS = 8  # a suggestion lands a few seconds after the reply
 STEP_TIMEOUT = 300
 RESEND_AFTER = 15  # a prompt that hasn't registered by then gets one more Enter
+CACHE_SECONDS = 330  # the 5-minute prompt cache, plus a margin
 # Set inside a Claude Code session; a nested `claude` would inherit them.
 NESTED_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
 
@@ -91,11 +98,22 @@ def transcript_state(records: list[dict], since: int) -> dict:
     }
 
 
+def main_events(step: dict, spend: list[dict]) -> list[dict]:
+    """The requests a step is about: its subagent's, its compaction, or the
+    user's own turn -- not the background calls around it."""
+    if step["type"] in ("subagent", "compaction"):
+        return [event for event in spend if event.get("request_type") == step["type"]]
+    return [event for event in spend if event.get("request_type") in ("normal", "skill")]
+
+
 def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], prices: dict, routes: dict) -> list[dict]:
     rows = []
     for index, step in enumerate(steps):
         events = [(kind, event) for _, kind, event, step_index in collected if step_index == index]
         spend = [event for kind, event in events if kind == "spend"]
+        mains = main_events(step, spend)
+        tiers = sorted({event.get("tier") for event in mains if event.get("tier")})
+        tier_ok = None if "tier" not in step else (bool(mains) and tiers == [step["tier"]])
         cost = without = 0.0
         comparable = True
         lanes, models = [], []
@@ -107,8 +125,8 @@ def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], 
             cost += actual
             without += baseline if baseline is not None else actual
             comparable &= baseline is not None
-            if not event.get("background"):
-                lane = event.get("skill_id") or "untagged"
+            if event in mains:
+                lane = lane_text(event)
                 model = pretty_model(served) if served else "?"
                 if (lane, model) not in zip(lanes, models):
                     lanes.append(lane)
@@ -118,6 +136,9 @@ def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], 
                 "step": step["name"],
                 "type": step["type"],
                 "routes": [f"{lane} → {model}" for lane, model in zip(lanes, models)],
+                "expected_tier": step.get("tier"),
+                "tiers": tiers,
+                "tier_ok": tier_ok,
                 "requests": len(spend),
                 "background": sum(1 for event in spend if event.get("background")),
                 "denied": sum(1 for kind, _ in events if kind == "deny"),
@@ -256,6 +277,33 @@ class Terminal:
         os.close(self.master)
 
 
+def last_gateway_activity() -> float | None:
+    """When the gateway last answered a request (epoch seconds), from its log."""
+    output = subprocess.run(
+        ["docker", "compose", "logs", "-t", "--no-log-prefix", "--since", "15m", "litellm"],
+        cwd=REPO, capture_output=True, text=True,
+    ).stdout
+    spend = [when for when, kind, _ in parse(output.splitlines()) if kind == "spend"]
+    return spend[-1].timestamp() if spend else None
+
+
+def wait_for_cold_cache() -> float | None:
+    """Claude Code's tools and system prompt are the same in every session, so
+    a run started soon after other traffic reads them from cache. Waiting until
+    the cache has expired makes runs comparable. Returns how long ago the
+    gateway was last active when the run started (None if not in 15 min)."""
+    last = last_gateway_activity()
+    if last is None:
+        return None
+    remaining = CACHE_SECONDS - (time.time() - last)
+    while remaining > 0:
+        print(f"cold start: waiting {int(remaining)} s for the prompt cache to expire", flush=True)
+        time.sleep(min(30, remaining))
+        last = last_gateway_activity() or last
+        remaining = CACHE_SECONDS - (time.time() - last)
+    return time.time() - last
+
+
 def gateway_up() -> bool:
     try:
         with urllib.request.urlopen(f"{GATEWAY}/health/liveliness", timeout=3) as response:
@@ -340,9 +388,10 @@ def run(scenario: dict, client: Path, quick: bool) -> tuple[str, list[dict], lis
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a scripted Claude Code session through llm-trunk.")
-    parser.add_argument("scenario", nargs="?", default=str(REPO / "scenarios" / "qa-day.yaml"))
+    parser.add_argument("scenario", nargs="?", default=str(REPO / "scenarios" / "dev-day.yaml"))
     parser.add_argument("--client", default=str(REPO.parent / "company-client"), help="repo Claude Code runs in")
     parser.add_argument("--quick", action="store_true", help="skip idle steps")
+    parser.add_argument("--cold-start", action="store_true", help="first wait until the prompt cache is cold")
     parser.add_argument("--dry-run", action="store_true", help="list the steps and exit")
     args = parser.parse_args()
 
@@ -355,6 +404,7 @@ def main() -> None:
     if not gateway_up():
         sys.exit(f"error: gateway not reachable at {GATEWAY} — start it with docker compose up -d")
 
+    idle_before = wait_for_cold_cache() if args.cold_start else None
     started = datetime.now()
     session_id, steps, collected, statuses = run(scenario, Path(args.client), args.quick)
     prices, routes = dashboard.load_prices(), dashboard.load_routes()
@@ -365,7 +415,15 @@ def main() -> None:
         row["check"] = check
         row["status"] = status
 
+    catalog, tier_models = check_rules.load_config()
+    stamped = [(datetime.fromtimestamp(arrived, timezone.utc), kind, event) for arrived, kind, event, _ in collected]
+    rules = check_rules.check(stamped, catalog, tier_models)
     print_table(scenario["name"], rows)
+    for violation in rules["violations"]:
+        print(f"✗ rule: {violation['rule']}: {violation['problem']}")
+    tier_misses = [row["step"] for row in rows if row["tier_ok"] is False]
+    print(f"rules: {rules['checked']} requests checked, {len(rules['violations'])} violation(s)"
+          f" · tiers: {'all as expected' if not tier_misses else 'unexpected in ' + ', '.join(tier_misses)}")
     out = REPO / "scenarios" / "results" / f"{started:%Y%m%d-%H%M%S}-{scenario['name']}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
@@ -373,6 +431,9 @@ def main() -> None:
         "session": session_id,
         "started": started.isoformat(),
         "quick": args.quick,
+        "cold_start": args.cold_start,
+        "idle_before_seconds": idle_before,
+        "rule_violations": rules["violations"],
         "steps": rows,
         "events": [{"arrived": arrived, "kind": kind, "step": index, **event} for arrived, kind, event, index in collected],
     }, indent=1))
@@ -385,7 +446,7 @@ def print_table(name: str, rows: list[dict]) -> None:
     from rich.text import Text
 
     table = Table(title=f"scenario · {name}", title_justify="left", header_style="dim")
-    for column, justify in (("STEP", "left"), ("TYPE", "left"), ("ROUTED TO", "left"), ("REQS", "right"),
+    for column, justify in (("STEP", "left"), ("TYPE", "left"), ("ROUTED TO", "left"), ("TIER", "center"), ("REQS", "right"),
                             ("COST", "right"), ("WITHOUT", "right"), ("VS ASKED", "right"), ("CHECK", "center")):
         table.add_column(column, justify=justify)
     for row in rows:
@@ -397,13 +458,15 @@ def print_table(name: str, rows: list[dict]) -> None:
         if row.get("status", "ok") != "ok":
             check = row["status"].upper()
         check_text = Text(check or "", style={"PASS": "green"}.get(check or "", "bold red" if check else "dim"))
-        table.add_row(row["step"], row["type"], "\n".join(row["routes"]) or "—", requests, f"${row['cost']:.3f}",
+        tier = Text("—" if row["tier_ok"] is None else ("✓" if row["tier_ok"] else f"✗ {row['expected_tier']}"),
+                    style={True: "green", False: "bold red"}.get(row["tier_ok"], "dim"))
+        table.add_row(row["step"], row["type"], "\n".join(row["routes"]) or "—", tier, requests, f"${row['cost']:.3f}",
                       f"${row['without']:.3f}" if row["comparable"] else "—", dashboard.vs_asked(saving), check_text)
     cost = sum(row["cost"] for row in rows)
     without = sum(row["without"] for row in rows)
     checked = [row["check"] for row in rows if row.get("check")]
     table.add_section()
-    table.add_row("TOTAL", "", "", str(sum(row["requests"] for row in rows)), f"${cost:.3f}", f"${without:.3f}",
+    table.add_row("TOTAL", "", "", "", str(sum(row["requests"] for row in rows)), f"${cost:.3f}", f"${without:.3f}",
                   dashboard.vs_asked((without - cost) / without if without else None),
                   f"{checked.count('PASS')}/{len(checked)}" if checked else "")
     # Piped or redirected output defaults to 80 columns, too narrow for the table.

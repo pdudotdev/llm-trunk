@@ -37,10 +37,12 @@ def test_parse_keeps_only_llm_trunk_events():
 
 def test_summarize_totals():
     summary = report.summarize(report.parse(LINES))
-    plan = summary["lanes"]["plan"]
-    assert (plan["requests"], plan["input"], plan["cached"], plan["output"]) == (3, 81900, 40000, 1510)
-    assert round(plan["cost"], 3) == 0.281
-    assert summary["lanes"]["untagged"]["requests"] == 1
+    # Old-format lines: an invocation is a skill, a sticky follow-up is normal, the title is background.
+    assert summary["types"]["skill"]["requests"] == 1 and round(summary["types"]["skill"]["cost"], 3) == 0.25
+    normal = summary["types"]["normal"]
+    assert (normal["requests"], normal["input"], normal["cached"]) == (2, 61000, 40000)
+    assert summary["types"]["background"]["requests"] == 1
+    assert summary["tiers"]["(lane) plan-lane"]["requests"] == 3
     assert summary["background"] == {"title": 1}
     assert summary["denies"] == {"input_cap": 1}
     assert summary["failures"] == {"529": 1}
@@ -51,9 +53,10 @@ def test_summarize_totals():
 
 
 def test_render_shows_the_headline_numbers():
-    text = report.render(report.summarize(report.parse(LINES)), {"plan-lane": "Opus 5", "untagged": "Haiku 4.5"})
-    assert "plan" in text and "$0.281" in text
+    text = report.render(report.summarize(report.parse(LINES)))
+    assert "REQUEST TYPE" in text and "skill" in text and "$0.250" in text
     assert "TOTAL" in text and "$0.301" in text
+    assert "By tier:" in text
     assert "title ×1" in text
     assert "input_cap ×1" in text and "529 ×1" in text
     assert "Input-size estimate vs billed: median +10%" in text
@@ -61,11 +64,21 @@ def test_render_shows_the_headline_numbers():
 
 
 def test_render_with_no_events():
-    assert "No llm-trunk events" in report.render(report.summarize([]), {})
+    assert "No llm-trunk events" in report.render(report.summarize([]))
 
 
 def test_missing_fields_count_as_zero():
     line = _line("2026-09-23T09:00:00", "spend", skill_id=None, session="s3")
     summary = report.summarize(report.parse([line]))
-    assert summary["lanes"]["untagged"] == {"requests": 1, "input": 0, "cached": 0, "output": 0, "cost": 0.0}
+    assert summary["types"]["normal"] == {"requests": 1, "input": 0, "cached": 0, "output": 0, "cost": 0.0}
     assert summary["estimate_errors"] == []
+
+
+def test_new_lines_group_by_request_type_and_tier():
+    lines = [
+        _line("2026-09-26T12:00:00", "spend", request_type="subagent", tier="moderate", session="s9", cost=0.02, input_tokens=100, output_tokens=5),
+        _line("2026-09-26T12:00:01", "spend", request_type="compaction", tier="complex", session="s9", cost=0.07, input_tokens=100, output_tokens=5),
+    ]
+    summary = report.summarize(report.parse(lines))
+    assert set(summary["types"]) == {"subagent", "compaction"}
+    assert set(summary["tiers"]) == {"moderate", "complex"}

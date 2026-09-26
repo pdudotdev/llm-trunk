@@ -1,45 +1,52 @@
-version: 1
-untagged:
-  alias: untagged
-  vendor: anthropic
-  effort: low
-  max_input: 64000
-  max_output: 4000
+version: 2
 
-skills:
-  qa-test-plan-creation:
-    sha256: "f3e80152b73f74c06a951f7de131a8a0555dac7887653f7c7e331a051d3924a3"
-    bytes: 780
-    bucket: L
-    alias: qa-test-plan-creation
+# Cheapest first. Unregistered skills and plain chat go to the first;
+# subagents run one step below their parent, never below the first.
+order: [light, moderate, complex]
+
+# Each tier's model lives in litellm/config.yaml under the same name, so a
+# new model release is a one-line change there.
+tiers:
+  light:
     vendor: anthropic
-    effort: high
-    max_input: 180000
-    max_output: 8000
-  qa-test-case-execution:
-    sha256: "3c82bd904b0ff8cdd30990c59d395cf79eef4175064b120962be32bc3e53286f"
-    bytes: 726
-    bucket: M
-    alias: qa-test-case-execution
+    effort: low
+    max_input: 64000
+    max_output: 4000
+  moderate:
     vendor: anthropic
     effort: medium
     max_input: 128000
     max_output: 4000
-  qa-bug-logging:
-    sha256: "66fb6922dcdc8842912cdd965c533afd681b926cc0f80e6ab5b3aacac620fda7"
-    bytes: 663
-    bucket: S
-    alias: qa-bug-logging
+  complex:
     vendor: anthropic
-    effort: low
-    max_input: 96000
-    max_output: 3000
-  qa-fix-verification:
-    sha256: "0ea6046a29b03995c27c9f3a2805f5e1929c94f9a76926c1a04a8a864c1d0315"
-    bytes: 677
-    bucket: S
-    alias: qa-fix-verification
-    vendor: anthropic
-    effort: low
-    max_input: 64000
-    max_output: 2000
+    effort: high
+    max_input: 180000
+    max_output: 8000
+
+# Only these skills, with a matching hash, reach a tier above the lowest.
+# Anything else -- plain chat, unregistered skills -- goes to the lowest tier.
+skills:
+  design-review:
+    tier: complex
+    sha256: "28643128a44b56d7ac59e7d075d9b27fa1f0dff3275bb44d9824b0585742609e"
+    bytes: 627
+  incident-postmortem:
+    tier: complex
+    sha256: "7d99d4ff0879e71635e77ba5e2c003376f83355d75c0d557328062b814fc0da3"
+    bytes: 668
+  code-review:
+    tier: moderate
+    sha256: "b80501d2b2d34e05567bfcc59ef062c77e82173d05ad976a9fd279badab20aaa"
+    bytes: 521
+  unit-tests:
+    tier: moderate
+    sha256: "bc6e789851cd74981ce8c4f167ca62cb6956f3ad0032028a226acdf8d1f055c8"
+    bytes: 526
+  commit-message:
+    tier: light
+    sha256: "a7929e0d2123b6887fb2f3da522783396df2f731f9758e333db753e6337c5a10"
+    bytes: 424
+  changelog-summary:
+    tier: light
+    sha256: "9fd56598e3b51458fee3662ea91cfe4d062d546eca4505c5b4024274865ae19f"
+    bytes: 419

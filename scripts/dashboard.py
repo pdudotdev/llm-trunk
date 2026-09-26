@@ -37,8 +37,9 @@ from rich.text import Text
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from report import parse  # noqa: E402
-from watch import ICONS, REPO, STAMP_RE, fmt_tokens, pretty_model, route_kind  # noqa: E402
+from watch import ICONS, REPO, STAMP_RE, fmt_tokens, lane_text, model_key, pretty_model, request_type_of, route_kind  # noqa: E402
 
+REQUEST_TYPES = ("normal", "skill", "subagent", "compaction", "background")
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
 FEED_ROWS = 14
 SESSION_ROWS = 6
@@ -55,16 +56,6 @@ def load_routes(path: Path = REPO / "litellm" / "config.yaml") -> dict[str, str]
     """Lane alias -> the model it really calls."""
     config = yaml.safe_load(path.read_text())
     return {entry["model_name"]: entry["litellm_params"]["model"] for entry in config["model_list"]}
-
-
-def model_key(model: str | None) -> str | None:
-    """Any spelling of a Claude model id -> the key used in pricing.yaml."""
-    if not model:
-        return None
-    name = model.lower().split("/")[-1].replace("[1m]", "")
-    name = re.sub(r"^(?:[a-z-]+\.)?anthropic\.", "", name)  # Bedrock: us.anthropic.claude-...
-    name = re.sub(r"-v\d+(?::\d+)?$", "", name)  # Bedrock: ...-v1:0
-    return re.sub(r"-\d{8}$", "", name)  # dated snapshot: ...-20251001
 
 
 def token_cost(event: dict, price: dict) -> float | None:
@@ -115,13 +106,13 @@ class Dashboard:
         self.window = window_seconds
         self.first: datetime | None = None
         self.requests = self.denies = 0
-        self.actual = self.background_cost = 0.0
+        self.actual = 0.0
         self.compared = 0
         self.compared_actual = self.compared_without = 0.0
         self.input_tokens = self.cached_tokens = 0
-        self.lane_cost: dict[str, float] = defaultdict(float)
-        # lane -> [actual, without llm-trunk], over comparable requests only
-        self.lane_compare: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        self.type_cost: dict[str, float] = defaultdict(float)
+        # request type -> [actual, without llm-trunk], over comparable requests only
+        self.type_compare: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self.sessions: dict[str, dict] = {}
         self.feed: deque = deque(maxlen=FEED_ROWS)
 
@@ -137,15 +128,13 @@ class Dashboard:
     def _add_spend(self, when: datetime, event: dict) -> float | None:
         logged = event.get("cost")
         cost = float(logged) if isinstance(logged, (int, float)) else 0.0
-        lane = event.get("skill_id") or "untagged"
+        kind = request_type_of(event)
         routed_model = served_model(event, self.routes, self.prices)
         self.requests += 1
         self.actual += cost
-        self.lane_cost[lane] += cost
+        self.type_cost[kind] += cost
         self.input_tokens += event.get("input_tokens") or 0
         self.cached_tokens += event.get("cache_read_tokens") or 0
-        if event.get("background"):
-            self.background_cost += cost
         if event.get("session") and isinstance(event.get("input_tokens"), (int, float)):
             self.sessions[event["session"]] = {
                 "last": when.timestamp(),
@@ -158,17 +147,17 @@ class Dashboard:
         self.compared += 1
         self.compared_actual += cost
         self.compared_without += baseline
-        self.lane_compare[lane][0] += cost
-        self.lane_compare[lane][1] += baseline
+        self.type_compare[kind][0] += cost
+        self.type_compare[kind][1] += baseline
         return (baseline - cost) / baseline if baseline else None
 
     @property
     def saved(self) -> float:
         return self.compared_without - self.compared_actual
 
-    def lane_saving(self, lane: str) -> float | None:
-        """Share saved on this lane vs the models asked for; negative = costs more."""
-        actual, without = self.lane_compare.get(lane, (0.0, 0.0))
+    def type_saving(self, kind: str) -> float | None:
+        """Share saved on this request type vs the models asked for; negative = costs more."""
+        actual, without = self.type_compare.get(kind, (0.0, 0.0))
         return (without - actual) / without if without else None
 
     def cache_state(self, session: dict) -> tuple[bool, int, float | None, float | None]:
@@ -232,24 +221,25 @@ def header(dash: Dashboard) -> Panel:
     return Panel(Group(headline, detail), title=title, subtitle=Text(since, style="dim"), title_align="left")
 
 
-def lanes_panel(dash: Dashboard) -> Panel:
+def types_panel(dash: Dashboard) -> Panel:
     table = Table.grid(padding=(0, 1))
     table.add_column(no_wrap=True)
     table.add_column(no_wrap=True)
     table.add_column(justify="right", no_wrap=True)
     table.add_column(justify="right", style="dim", no_wrap=True)
     table.add_column(justify="right", no_wrap=True)
-    for lane, cost in sorted(dash.lane_cost.items(), key=lambda item: -item[1])[:6]:
+    for kind in REQUEST_TYPES:
+        cost = dash.type_cost.get(kind)
+        if cost is None:
+            continue
         share = cost / dash.actual if dash.actual else 0
         bar = "█" * round(share * 8)
-        table.add_row(lane[:21], Text(bar.ljust(8), style="cyan"), f"{share:.0%}", _money(cost), vs_asked(dash.lane_saving(lane)))
+        table.add_row(kind, Text(bar.ljust(8), style="cyan"), f"{share:.0%}", _money(cost), vs_asked(dash.type_saving(kind)))
     table.add_row("", "", "", "", "")
     hit = dash.cached_tokens / dash.input_tokens if dash.input_tokens else 0
     table.add_row("input from cache", Text(("█" * round(hit * 8)).ljust(8), style="green"), f"{hit:.0%}", "", "")
-    background = dash.background_cost / dash.actual if dash.actual else 0
-    table.add_row("background calls", Text(("█" * round(background * 8)).ljust(8), style="yellow"), f"{background:.0%}", _money(dash.background_cost), "")
     table.add_row("denied", "", str(dash.denies), "", "")
-    return Panel(table, title="spend by lane · vs model asked for", title_align="left")
+    return Panel(table, title="spend by request type · vs model asked for", title_align="left")
 
 
 def sessions_panel(dash: Dashboard) -> Panel:
@@ -277,7 +267,7 @@ def sessions_panel(dash: Dashboard) -> Panel:
 
 def feed_panel(dash: Dashboard) -> Panel:
     table = Table(box=None, padding=(0, 1), show_edge=False, header_style="dim")
-    for name, justify in (("TIME", "left"), ("ROUTE", "left"), ("LANE", "left"), ("MODEL · EFFORT", "left"),
+    for name, justify in (("TIME", "left"), ("ROUTE", "left"), ("TIER · SKILL", "left"), ("MODEL · EFFORT", "left"),
                           ("INPUT", "right"), ("COST", "right"), ("VS ASKED", "right")):
         table.add_column(name, justify=justify, no_wrap=True)
     for when, kind, event, saving in dash.feed:
@@ -291,7 +281,7 @@ def feed_panel(dash: Dashboard) -> Panel:
             cost = event.get("cost")
             table.add_row(
                 Text(clock, style="dim"), Text(label, style="bold" if route == "invoked" else ""),
-                event.get("skill_id") or "untagged",
+                lane_text(event),
                 _model_text(served_model(event, dash.routes, dash.prices), event.get("effort")),
                 size, _money(cost) if isinstance(cost, (int, float)) else "—", vs_asked(saving),
             )
@@ -300,7 +290,7 @@ def feed_panel(dash: Dashboard) -> Panel:
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['denied']} denied", style="red"), Text(reason[:70], style="red"))
         elif kind == "failed":
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['failed']} failed", style="red"),
-                          event.get("skill_id") or "untagged", Text(f"upstream {event.get('status') or 'error'}", style="red"))
+                          lane_text(event), Text(f"upstream {event.get('status') or 'error'}", style="red"))
         else:
             table.add_row(Text(clock, style="dim"), Text(f"{ICONS['expired']} expired", style="yellow"),
                           Text(f"{event.get('skill_id')} ({event.get('why')}) → back to untagged", style="yellow"))
@@ -310,7 +300,7 @@ def feed_panel(dash: Dashboard) -> Panel:
 def render(dash: Dashboard) -> Layout:
     layout = Layout()
     layout.split_column(Layout(header(dash), size=4), Layout(name="middle", size=12), Layout(feed_panel(dash)))
-    layout["middle"].split_row(Layout(lanes_panel(dash)), Layout(sessions_panel(dash)))
+    layout["middle"].split_row(Layout(types_panel(dash)), Layout(sessions_panel(dash)))
     return layout
 
 

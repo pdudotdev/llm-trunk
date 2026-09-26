@@ -1,0 +1,90 @@
+# A short developer day in Claude Code, touching every kind of request
+# llm-trunk routes: normal turns, registered skills on every tier, an
+# unregistered skill, a subagent, compaction, Claude Code's own background
+# calls (titles, suggestions, permission checks happen along the way), and an
+# idle gap longer than the prompt cache lasts.
+#
+# Run with: python3 scenarios/run.py              (add --quick to skip the idle gap)
+#
+# `expect` is the check for that step's answer: text that must appear in it.
+# The demo skills start their answers with a fixed tag, which makes a simple,
+# objective pass/fail. `tier` is where the step's main request should go.
+name: dev-day
+
+steps:
+  - name: plain question
+    type: normal
+    tier: light
+    send: "In one sentence: what does a load balancer do?"
+
+  - name: design review
+    type: skill
+    tier: complex
+    send: "/design-review Move session storage from sticky in-memory sessions to Redis, so any app server can serve any user."
+    expect: "[DEMO DESIGN REVIEW]"
+
+  - name: follow-up on the design
+    type: normal
+    tier: complex
+    send: "Which of those risks would you tackle first? One sentence."
+
+  - name: subagent from a complex session
+    type: subagent
+    tier: moderate
+    send: "Use a subagent to list the folders in .claude/skills. One line per folder with the folder name, nothing else."
+    expect: "code-review"
+
+  - name: code review
+    type: skill
+    tier: moderate
+    send: "/code-review A change that retries failed Redis writes up to 3 times with no backoff and swallows the final error."
+    expect: "[DEMO CODE REVIEW]"
+
+  - name: unit tests
+    type: skill
+    tier: moderate
+    send: "/unit-tests A function that parses a session id from a cookie and returns None when it is missing or malformed."
+    expect: "[DEMO UNIT TESTS]"
+
+  - name: unregistered skill
+    type: skill
+    tier: light
+    send: "/personal-notes ask ops about redis failover before friday and check the session ttl"
+    expect: "[DEMO NOTE]"
+
+  - name: follow-up after it
+    type: normal
+    tier: light
+    send: "Turn that into a single sentence."
+
+  - name: incident postmortem
+    type: skill
+    tier: complex
+    send: "/incident-postmortem Logins failed for 40 minutes after a Redis failover because the app cached the old primary address."
+    expect: "[DEMO POSTMORTEM]"
+
+  - name: compaction
+    type: compaction
+    tier: complex
+    send: "/compact"
+
+  - name: commit message
+    type: skill
+    tier: light
+    send: "/commit-message Moved sessions to Redis and added a retry with backoff on write failures."
+    expect: "[DEMO COMMIT MESSAGE]"
+
+  - name: changelog
+    type: skill
+    tier: light
+    send: "/changelog-summary Sessions survive server restarts; fixed login failures after Redis failover; retries on write errors."
+    expect: "[DEMO CHANGELOG]"
+
+  - name: idle past the cache
+    type: idle
+    wait_seconds: 330
+
+  - name: back after a break
+    type: normal
+    tier: light
+    send: "Summarize today's work in two sentences."

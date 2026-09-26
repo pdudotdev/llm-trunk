@@ -6,13 +6,24 @@ import json
 import types
 
 import pytest
-from conftest import REPO, HTTPException, assistant, request, skill_turn, user
+from conftest import (
+    REPO,
+    HTTPException,
+    assistant,
+    compaction_request,
+    permission_check_request,
+    request,
+    skill_turn,
+    subagent_request,
+    unregistered_turn,
+    user,
+)
 
 spec = importlib.util.spec_from_file_location("watch", REPO / "scripts" / "watch.py")
 watch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(watch)
 
-MODELS = {"plan-lane": "Opus 5", "untagged": "Haiku 4.5"}
+MODELS = {"complex": "Opus 5.5", "moderate": "Sonnet 5", "light": "Haiku 4.5"}
 
 
 def _log_lines(output: str) -> list[str]:
@@ -34,65 +45,102 @@ def _log_spend(gateway, data, cost=0.0123):
     asyncio.run(gateway.callback.async_log_success_event(kwargs, response, None, None))
 
 
-def test_spend_event_is_rendered(gateway, capsys):
-    data = gateway.send(request(skill_turn("plan")))
+def _spend_line(gateway, capsys, data) -> str:
+    capsys.readouterr()
     _log_spend(gateway, data)
     (line,) = _log_lines(capsys.readouterr().out)
+    return line
+
+
+def test_spend_event_is_rendered(gateway, capsys):
+    line = _spend_line(gateway, capsys, gateway.send(request(skill_turn("plan"))))
     kind, event = _event(line)
     assert kind == "spend"
-    assert event["skill_id"] == "plan" and event["alias"] == "plan-lane" and event["effort"] == "high"
+    assert (event["request_type"], event["tier"], event["skill_id"], event["effort"]) == ("skill", "complex", "plan", "high")
     assert (event["input_tokens"], event["output_tokens"], event["cache_read_tokens"]) == (41000, 250, 40000)
     assert event["cache_write_tokens"] == 500
     assert event["model"] == "claude-opus-5-5-20260915"  # what actually answered
-    assert event["requested_model"] == "claude-sonnet-5"  # what the client asked for, before the lane
-    assert event["cost"] == 0.0123
+    assert event["requested_model"] == "claude-sonnet-5"  # what the client asked for
+    assert event["session_tier"] == "light" and event["cost"] == 0.0123
     rendered = watch.render(line, "12:00:00", MODELS)
-    assert "invoked" in rendered and "Opus 5 · high" in rendered and "(c)" in rendered and "$0.012" in rendered
+    assert "invoked" in rendered and "Opus 5.5 · high" in rendered and "complex · plan" in rendered
+    assert "(c)" in rendered and "$0.012" in rendered
 
 
-def test_sticky_spend_event_is_rendered(gateway, capsys):
-    gateway.send(request(skill_turn("plan")))
-    data = gateway.send(request(skill_turn("plan"), assistant(), user("Next?")))
-    _log_spend(gateway, data)
-    (line,) = _log_lines(capsys.readouterr().out)
-    assert "sticky" in watch.render(line, "12:00:00", MODELS)
+@pytest.mark.parametrize(
+    ("build", "route", "lane"),
+    [
+        (lambda: request(skill_turn("plan"), assistant(), user("Next?")), "sticky", "complex · plan"),
+        (lambda: subagent_request(), "subagent", "moderate"),
+        (lambda: compaction_request(skill_turn("plan"), assistant(), user("go")), "compaction", "complex · plan"),
+        (lambda: request(skill_turn("plan"), assistant(), unregistered_turn()), "unregistered", "light · personal-notes"),
+        (lambda: permission_check_request(), "passthrough", "passed through"),
+    ],
+)
+def test_every_request_type_is_rendered(gateway, capsys, build, route, lane):
+    gateway.send(request(skill_turn("plan")))  # puts the session on the complex tier
+    rendered = watch.render(_spend_line(gateway, capsys, gateway.send(build())), "12:00:00", MODELS)
+    assert f"{watch.ICONS[route]} {route}" in rendered
+    assert lane in rendered
+
+
+def test_passthrough_shows_the_model_claude_code_chose(gateway, capsys):
+    rendered = watch.render(_spend_line(gateway, capsys, gateway.send(permission_check_request())), "12:00:00", MODELS)
+    assert "Sonnet 5" in rendered
+
+
+def test_long_lane_is_truncated_to_the_column(gateway, capsys):
+    event = {"request_type": "skill", "tier": "complex", "skill_id": "incident-postmortem", "skill_hash": "h", "alias": "complex"}
+    text = watch.lane_text(event)
+    assert text == "complex · incident-postmortem"
+    rendered = watch.render("llm-trunk spend: " + json.dumps(event), "12:00:00", MODELS)
+    _, width, _ = watch.COLUMNS[4]
+    assert text[: width - 1] + "…" in rendered
 
 
 def test_deny_event_is_rendered(gateway, capsys):
+    capsys.readouterr()
     with pytest.raises(HTTPException):
         gateway.send(request(user("x" * 200_000)))
     (line,) = _log_lines(capsys.readouterr().out)
     kind, event = _event(line)
-    assert (kind, event["code"]) == ("deny", "input_cap")
-    assert "untagged lane cap" in watch.render(line, "12:00:00", MODELS)
+    assert (kind, event["code"], event["request_type"]) == ("deny", "input_cap", "normal")
+    assert "light tier cap" in watch.render(line, "12:00:00", MODELS)
 
 
 def test_failed_event_is_rendered(gateway, capsys):
     data = gateway.send(request(user("Hi")))
-    error = types.SimpleNamespace(status_code=529)
-    kwargs = {"litellm_params": {"metadata": data["litellm_metadata"]}, "exception": error}
+    capsys.readouterr()
+    kwargs = {"litellm_params": {"metadata": data["litellm_metadata"]}, "exception": types.SimpleNamespace(status_code=529)}
     asyncio.run(gateway.callback.async_log_failure_event(kwargs, None, None, None))
     (line,) = _log_lines(capsys.readouterr().out)
     kind, event = _event(line)
-    assert (kind, event["status"]) == ("failed", 529)
+    assert (kind, event["status"], event["tier"]) == ("failed", 529, "light")
     assert "529" in watch.render(line, "12:00:00", MODELS)
 
 
 def test_expired_event_is_rendered(gateway, clock, capsys):
     gateway.send(request(skill_turn("plan")))
     clock.advance(10_000)
+    capsys.readouterr()
     gateway.send(request(skill_turn("plan"), assistant(), user("Next?")))
     (line,) = _log_lines(capsys.readouterr().out)
     kind, event = _event(line)
-    assert (kind, event["skill_id"]) == ("expired", "plan")
+    assert (kind, event["skill_id"], event["tier"]) == ("expired", "plan", "complex")
     assert "back to untagged" in watch.render(line, "12:00:00", MODELS)
 
 
+def test_old_event_lines_still_render():
+    # Logged before tiers: per-skill lanes, no request_type.
+    old = {"skill_id": "qa-bug-logging", "skill_hash": None, "alias": "qa-bug-logging", "effort": "low",
+           "session": "05887d29", "sticky_left_s": 300, "background": None, "input_tokens": 53000,
+           "cache_read_tokens": 52000, "cost": 0.012}
+    rendered = watch.render("llm-trunk spend: " + json.dumps(old), "11:34:16", {"qa-bug-logging": "Sonnet 5"})
+    assert "sticky" in rendered and "qa-bug-logging" in rendered and "Sonnet 5 · low" in rendered
+
+
 def test_watcher_ignores_unknown_fields(gateway, capsys):
-    # New fields (e.g. cache_write_tokens) must never break the watcher.
-    data = gateway.send(request(skill_turn("plan")))
-    _log_spend(gateway, data)
-    (line,) = _log_lines(capsys.readouterr().out)
+    line = _spend_line(gateway, capsys, gateway.send(request(skill_turn("plan"))))
     kind, event = _event(line)
-    extended = f"llm-trunk {kind}: " + json.dumps({**event, "cache_write_tokens": 500, "request_type": "skill"})
+    extended = f"llm-trunk {kind}: " + json.dumps({**event, "some_future_field": 1})
     assert watch.render(extended, "12:00:00", MODELS) == watch.render(line, "12:00:00", MODELS)
