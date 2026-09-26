@@ -9,7 +9,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
 
   litellm:
     # Pinned by digest (LiteLLM 1.102.0): policy/litellm_callback.py relies on

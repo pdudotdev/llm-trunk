@@ -22,9 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO))
-
-from policy.models import model_key  # noqa: E402  (re-exported for the other scripts)
+sys.path.insert(0, str(REPO))  # the other scripts import policy.* after importing this
 
 STAMP_RE = re.compile(r"^(?P<stamp>(?P<second>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*)\s+(?P<message>.*)$")
 # The gateway writes one JSON line per outcome: "llm-trunk <kind>: {...}".

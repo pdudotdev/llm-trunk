@@ -9,7 +9,7 @@ Read-only. Exits 1 if any request broke a rule, so it can gate a scenario run
 or a benchmark. Only events logged with request types are checked; older
 per-skill-lane lines are counted as skipped.
 
-The rules (see ROADMAP.md, "Design: tier-based routing"):
+The rules (see README.md, "How It Works"):
   normal turn            -> the session's tier (its sticky route, else the lowest)
   registered skill       -> its catalog tier
   unregistered skill     -> the lowest tier
@@ -18,8 +18,9 @@ The rules (see ROADMAP.md, "Design: tier-based routing"):
   compaction             -> the session's tier
   suggestion / recap     -> the session's tier
   session title          -> the lowest tier
-  permission check       -> the tier running the model Claude Code asked for
-                            (the most capable tier if none does); effort as sent
+  permission check       -> the tier running the model Claude Code asked for,
+                            never above the highest tier the key can reach
+                            (that ceiling if no tier runs it); effort as sent
 and the model that answered must be the one configured for the tier.
 """
 import argparse
@@ -35,9 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from report import parse  # noqa: E402
-from watch import REPO, model_key  # noqa: E402
+from watch import REPO  # noqa: E402
 
 from policy.decide import lowest, one_down  # noqa: E402
+from policy.models import model_key  # noqa: E402
 
 
 def load_config() -> tuple[dict, dict[str, str]]:

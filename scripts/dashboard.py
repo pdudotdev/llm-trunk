@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report import parse  # noqa: E402
 
 from policy.decide import REQUEST_TYPES  # noqa: E402  (watch puts the repo on the path)
-from watch import ICONS, REPO, STAMP_RE, fmt_tokens, tier_text, model_key, pretty_model, request_type_of, route_kind  # noqa: E402
+from policy.models import model_key  # noqa: E402
+from watch import ICONS, REPO, STAMP_RE, fmt_tokens, tier_text, pretty_model, request_type_of, route_kind  # noqa: E402
 
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
 FEED_ROWS = 14

@@ -23,8 +23,6 @@ Start a fresh Claude Code session for tests 1–6 and run them in order.
 | 10 | After test 2 or 5, leave the session idle for more than 10 minutes, then send a message | An `⏳ expired … (idle) → back to untagged` row appears just before your message. Your message shows `⚪ untagged` on **light**. | The sticky tier times out after 10 minutes idle, or 30 minutes after the last invocation. Expiry is recorded at the next request, so that's when the row appears. |
 
 **Overall pass:** the dashboard's SAVED figure grows as you go. After the run, `python3 scripts/check_rules.py --since 1h` reports **no rule violations**.
-
-If test 10 doesn't show an expiry icon, the row still reads "expired … back to untagged"; I didn't confirm the icon itself.
 """
 
 if __name__ == "__main__":
