@@ -156,3 +156,30 @@ def test_check_answers_fail_and_missing(tmp_path):
     assert run.check_answers(STEPS, run.transcript_entries(path))[1] == "FAIL"
     empty = _transcript(tmp_path, [("user", "something else")])
     assert run.check_answers(STEPS, run.transcript_entries(empty))[1] == "?"
+
+
+def test_held_step_is_judged_on_the_rules_tier_and_optionally_where_it_ran():
+    steps = [{"name": "change review", "type": "skill", "tier": "moderate", "send": "/change-review x"},
+             {"name": "pinned", "type": "skill", "tier": "moderate", "served": "moderate", "send": "/change-review y"}]
+    held = _spend(request_type="skill", skill_id="change-review", skill_hash="h", tier="complex", alias="complex",
+                  held_for="moderate", model="claude-opus-5-5", cost=0.02)
+    rows = run.summarize(steps, [(1.0, "spend", held, 0), (2.0, "spend", held, 1)], PRICES, ROUTES)
+    assert rows[0]["tier_ok"] is True and rows[0]["routes"] == ["complex (held for moderate) · change-review → Opus 5.5"]
+    assert rows[1]["tier_ok"] is False  # it ran on complex, not moderate
+
+
+def test_scenario_baseline_knows_the_cache_stays_warm_across_steps():
+    upgrade = _spend(request_type="skill", skill_id="design-review", skill_hash="h", tier="complex", alias="complex",
+                     model="claude-opus-5-5", input_tokens=53_000, cache_write_tokens=53_000, estimated_input_tokens=41_000,
+                     cost=0.278)
+    collected = [(1.0, "spend", _spend(estimated_input_tokens=40_000), 0), (21.0, "spend", upgrade, 1)]
+    rows = run.summarize(STEPS[:2], collected, PRICES, ROUTES)
+    assert rows[1]["without"] < 0.05  # Opus would have read the conversation back
+
+
+def test_cache_aware_scenario_expects_a_hold_then_a_free_move():
+    scenario = run.load(REPO / "scenarios" / "cache-aware.yaml")
+    held = [step for step in scenario["steps"] if step.get("served") and step["served"] != step["tier"]]
+    assert [(step["tier"], step["served"]) for step in held] == [("moderate", "complex")]
+    idle = next(step for step in scenario["steps"] if step["type"] == "idle")
+    assert idle["wait_seconds"] > 300 + 180  # the cache and a recap's refresh have both run out

@@ -109,26 +109,38 @@ def main_events(step: dict, spend: list[dict]) -> list[dict]:
 
 def summarize(steps: list[dict], collected: list[tuple[float, str, dict, int]], prices: dict, routes: dict) -> list[dict]:
     rows = []
+    # "Without llm-trunk" knows Claude Code's own cache would have stayed warm,
+    # so it follows the whole run in order, across steps.
+    baselines = dashboard.Baseline(prices, CACHE_SECONDS - 30)
+    by_step: dict[int, list] = {}
+    for arrived, kind, event, step_index in collected:
+        if kind == "spend":
+            by_step.setdefault(step_index, []).append(baselines.cost(datetime.fromtimestamp(arrived, timezone.utc), event,
+                                                                     dashboard.served_model(event, routes, prices)))
     for index, step in enumerate(steps):
         events = [(kind, event) for _, kind, event, step_index in collected if step_index == index]
         spend = [event for kind, event in events if kind == "spend"]
         mains = main_events(step, spend)
-        tiers = sorted({event.get("tier") for event in mains if event.get("tier")})
+        # A held request serves on a higher tier than the rules pick: the
+        # step's `tier` is the rules' tier, `served` (optional) where it ran.
+        tiers = sorted({event.get("held_for") or event.get("tier") for event in mains if event.get("tier")})
         tier_ok = None if "tier" not in step else (bool(mains) and tiers == [step["tier"]])
+        served = sorted({event.get("tier") for event in mains if event.get("tier")})
+        if "served" in step and tier_ok is not False:
+            tier_ok = bool(mains) and served == [step["served"]]
         cost = without = 0.0
         comparable = True
         places, models = [], []
-        for event in spend:
+        for event, baseline in zip(spend, by_step.get(index, [])):
             logged = event.get("cost")
             actual = float(logged) if isinstance(logged, (int, float)) else 0.0
-            served = dashboard.served_model(event, routes, prices)
-            baseline = dashboard.without_trunk(event, served, prices)
+            served_by = dashboard.served_model(event, routes, prices)
             cost += actual
             without += baseline if baseline is not None else actual
             comparable &= baseline is not None
             if event in mains:
                 where = tier_text(event)
-                model = pretty_model(served) if served else "?"
+                model = pretty_model(served_by) if served_by else "?"
                 if (where, model) not in zip(places, models):
                     places.append(where)
                     models.append(model)

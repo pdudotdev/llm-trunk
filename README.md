@@ -73,9 +73,11 @@ llm-trunk is a local proxy on `127.0.0.1:4000`, between Claude Code and Anthropi
 | Suggestions and away summaries | The session's tier, so the prompt cache isn't lost |
 | Session titles | `light` |
 | Auto mode's permission checks | The tier running the model Claude Code asked for, so the safety check isn't weakened |
+| Any move to a cheaper tier while the conversation is still cached on its current one | Waits on the current tier (⚓ held) until moving pays for re-caching the conversation |
 
 ▫️ **Key characteristics:**
-- [x] **Bounded stickiness:** after a registered skill runs, your next messages stay on its tier. This ends after 10 minutes idle, or 30 minutes after the skill was last run
+- [x] **Bounded stickiness:** after a registered skill runs, your next messages stay on its tier. This ends after 5 minutes idle (when the prompt cache expires), or 30 minutes after the skill was last run
+- [x] **Cache-aware:** a move to a cheaper tier waits while the conversation is still cached where it is, until moving costs no more than staying has. Moves up always happen at once
 - [x] **Deny rules:** an edited skill, or input over the tier's cap, is rejected with the reason before it reaches Anthropic
 - [x] **Measured:** every request is logged with its type, tier, tokens, cost, and the model that answered
 - [x] **A local lab:** one machine (macOS or Ubuntu) with Docker Compose, not a production service
@@ -107,8 +109,8 @@ llm-trunk is a local proxy on `127.0.0.1:4000`, between Claude Code and Anthropi
 | 1 | Ask a plain question in a new session | `light` (Haiku 4.5, low) |
 | 2 | Run `/design-review` | `complex` (Opus 5.5, high), sticky |
 | 3 | Ask a follow-up | stays on `complex` |
-| 4 | Run `/change-review` | switches to `moderate` (Sonnet 5, medium) |
-| 5 | Ask Claude to use a subagent | `light`, one tier below `moderate` |
+| 4 | Run `/change-review` | `moderate` by the rules, but ⚓ held on `complex`: Opus still has the conversation cached, and moving would re-cache it on Sonnet 5 |
+| 5 | Ask Claude to use a subagent | `light`, one tier below the rules' `moderate` |
 | 6 | Run `/personal-notes` (not in the catalog) | `light`, and the next message stays there |
 | 7 | Run `/compact` in a `complex` session over the cap | stays on `complex`, no cap |
 | 8 | Edit a skill file, then run the skill | **denied**: the skill changed since it was hashed |
@@ -117,7 +119,7 @@ llm-trunk is a local proxy on `127.0.0.1:4000`, between Claude Code and Anthropi
 
 A denial shows up in Claude Code as, for example: `API Error: 400 llm-trunk: ~89409 input tokens exceeds the light tier cap (64000) — run /compact or start a new session`.
 
-> ⚠️ **NOTE:** Changing to a tier with a different model or effort makes the next message uncached (see [Concepts 101](#-concepts-101)). Subagents are the cheapest place to use a lower tier, since they start with a fresh context.
+> ⚠️ **NOTE:** Changing to a tier with a different model or effort makes the next message uncached, which is why moves down wait (see [Concepts 101](#-concepts-101)). Subagents are the cheapest place to use a lower tier, since they start with a fresh context.
 
 ## 🚀 Installation & Usage
 
@@ -183,7 +185,7 @@ python3 scripts/dashboard.py                # terminal 2, in llm-trunk: live cos
 ```
 The dashboard starts empty; add `--since 1h` to load recent history. Scroll the feed with ↑/↓ or the mouse wheel, `g` jumps back to the newest.
 
-> ⚠️ **NOTE:** Changes to `catalog.yaml` apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`.
+> ⚠️ **NOTE:** Changes to `catalog.yaml` and `pricing.yaml` apply immediately. Changes under `policy/` or to `litellm/config.yaml` need `docker compose restart litellm`. Changes to `docker-compose.yml` need `docker compose up -d`, which recreates the container and so erases the routing history.
 
 > ⚠️ **NOTE:** The routing history is kept in the gateway container's log. `docker compose down` erases it.
 
@@ -219,6 +221,22 @@ Anthropic caches the start of each request. A conversation only grows at the end
 - **Price:** a cache read costs 0.1× the normal input price (0.05× on Opus 5.5); a cache write costs 1.25×
 - **Expiry:** about 5 minutes without use
 - **Reset by:** changing the model or the effort settings, or rewriting earlier history (e.g. `/compact`). That's why changing tiers costs one uncached message
+- **Per model:** each model caches separately. Opus 5.5 and Sonnet 5 even read the cache at the same price ($0.20 per million tokens), so moving a cached conversation from Opus to Sonnet costs a full re-cache and saves almost nothing afterwards
+
+▫️ **Cache-aware switching (the `⚓ held` route)**
+
+Moving a conversation up (a skill that needs a stronger model) always happens at once. Moving it down only saves money, so it waits while the conversation is still cached on its current tier, and compares:
+
+| | Cost of this message |
+|---|---|
+| **Stay** | Read the conversation from the current model's cache, write the new part |
+| **Move** | Write the whole conversation on the cheaper model, minus what it already has cached (often Claude Code's tool list and system prompt, from other recent sessions) |
+
+It stays while *move − stay* is more than what staying has cost so far compared with the cheaper tier, and moves once staying has cost that much, or at once when the cache has expired (then moving is free). It's the rent-or-buy rule: it never pays more than about one extra re-cache, and a pause usually ends a hold for free. Set `cache_aware: false` in `catalog.yaml` to always move at once.
+
+Example (from a real run): after `/design-review`, `/change-review` wanted Sonnet 5. Moving re-cached 56k tokens for $0.143; staying on Opus 5.5 cost about $0.021.
+
+The dashboard's "without llm-trunk" figure assumes Claude Code, talking to Anthropic directly, would have kept its cache: a re-cache the gateway causes counts against it.
 
 ▫️ **Claude Code's own requests (the `(i)` tag)**
 
@@ -237,7 +255,7 @@ None of these extend the sticky timer, so they can't keep an expensive tier aliv
 |---|---|
 | [`catalog.yaml`](catalog.yaml) | Tiers and registered skills |
 | [`litellm/config.yaml`](litellm/config.yaml) | The model and prices for each tier |
-| [`pricing.yaml`](pricing.yaml) | Anthropic's list prices, for the "without llm-trunk" comparison |
+| [`pricing.yaml`](pricing.yaml) | Anthropic's list prices, for the "without llm-trunk" comparison and cache-aware switching |
 | [`docker-compose.yml`](docker-compose.yml) | LiteLLM and Postgres, reachable only from this machine |
 | [`.env.example`](.env.example) · [`client-settings.json.example`](client-settings.json.example) | Templates for `.env` and your client repo's `.claude/settings.json` |
 | [`policy/`](policy/) | The routing callback and rules |
@@ -246,7 +264,8 @@ None of these extend the sticky timer, so they can't keep an expensive tier aliv
 | [`tests/`](tests/) | Automated tests, plus the manual sanity suite in `tests/sanity/` |
 
 ## ⬆️ Planned Upgrades
-- [ ] Cache-aware switching: only move to a cheaper tier when the savings outweigh re-caching
+- [x] Cache-aware switching: only move to a cheaper tier when the savings outweigh re-caching
+- [ ] Keep a held conversation on its model but lower its effort (Opus 5.5's per-message effort keeps the cache)
 - [ ] Per-department virtual keys, each limited with `allowed_skills`, with spend shown per key
 
 ## 📄 Disclaimer

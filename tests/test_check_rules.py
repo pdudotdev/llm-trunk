@@ -159,3 +159,60 @@ def test_cli_exits_one_and_names_the_violation(tmp_path):
     result = _cli("--results", str(_results_file(tmp_path, [bad])))
     assert result.returncode == 1
     assert "expected tier light, got complex" in result.stdout and "1 rule violation(s)" in result.stdout
+
+
+def _big(*later):
+    return request(user("context " * 7_500), assistant(), *later)
+
+
+def test_a_session_with_holds_breaks_no_rule(gateway, capsys, clock):
+    steps = [
+        _big(skill_turn("plan")),
+        _big(skill_turn("plan"), assistant(), skill_turn("review")),  # held for moderate
+        _big(skill_turn("plan"), assistant(), skill_turn("review"), assistant(), user("[SUGGESTION MODE: x]")),
+        _big(skill_turn("plan"), assistant(), unregistered_turn()),  # held for light
+    ]
+    logged = []
+    for data in steps:
+        logged.append((T0, "spend", _logged(gateway, data, capsys)))
+        clock.advance(30)
+    assert [event.get("held_for") for _, _, event in logged] == [None, "moderate", "moderate", "light"]
+    assert check_rules.check(logged, make_catalog(), TIER_MODELS)["violations"] == []
+
+
+def _hold(**fields):
+    base = {"request_type": "normal", "tier": "complex", "session_tier": "light", "session": "s1", "held_for": "light",
+            "warm_tier": "complex", "recache_cost": 0.05, "held_so_far": 0.0, "model": "claude-opus-5-5", "started_at": 1000.0}
+    return (T0, "spend", {**base, **fields})
+
+
+PREVIOUS = _event(request_type="skill", skill_id="plan", tier="complex", model="claude-opus-5-5", started_at=900.0)
+
+
+@pytest.mark.parametrize(
+    ("hold", "problem"),
+    [
+        (_hold(started_at=1300.0), "its cache had expired"),
+        (_hold(recache_cost=0.02, held_so_far=0.03), "cost no more than holding had"),
+        (_hold(held_for="moderate"), "the rules' tier is light"),
+    ],
+)
+def test_each_bad_hold_is_caught(hold, problem):
+    result = check_rules.check([PREVIOUS, hold], make_catalog(), TIER_MODELS)
+    assert any(problem in violation["problem"] for violation in result["violations"])
+
+
+def test_hold_on_a_tier_that_never_served_the_conversation_is_caught():
+    result = check_rules.check([_hold()], make_catalog(), TIER_MODELS)
+    assert "wasn't served there" in result["violations"][0]["problem"]
+
+
+def test_one_hour_cache_keeps_a_hold_legal_past_five_minutes():
+    previous = (T0, "spend", {**PREVIOUS[2], "cache_write_1h_tokens": 500})
+    assert check_rules.check([previous, _hold(started_at=1600.0)], make_catalog(), TIER_MODELS)["violations"] == []
+
+
+def test_moving_down_when_holding_was_cheaper_is_caught():
+    moved = _event(recache_cost=0.1, held_so_far=0.01, warm_tier="complex", started_at=950.0)
+    result = check_rules.check([PREVIOUS, moved], make_catalog(), TIER_MODELS)
+    assert "cost more than holding had" in result["violations"][0]["problem"]

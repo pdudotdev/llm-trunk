@@ -164,3 +164,26 @@ def test_unknown_fields_are_ignored(gateway, capsys):
     kind, event = _event(line)
     extended = f"llm-trunk {kind}: " + json.dumps({**event, "some_future_field": 1})
     assert render(extended) == render(line)
+
+
+def test_held_request_is_rendered_with_its_route_and_note():
+    event = {"request_type": "skill", "skill_id": "change-review", "skill_hash": "h", "tier": "complex", "alias": "complex",
+             "held_for": "moderate", "warm_tier": "complex", "recache_cost": 0.126, "held_so_far": 0.0, "session": "s1"}
+    rendered = render("llm-trunk spend: " + json.dumps(event))
+    assert "⚓ held" in rendered and "held for moderate: moving now" in rendered
+    assert events.tier_text(event) == "complex (held for moderate) · change-review"
+    assert events.route_kind({**event, "request_type": "compaction"}) == "compaction"  # compaction shows as such
+
+
+def test_hold_ledger_nets_avoided_re_caches_against_what_holding_cost():
+    ledger = events.HoldLedger()
+    base = {"request_type": "normal", "session": "s1"}
+    ledger.add({**base, "held_for": "moderate", "recache_cost": 0.126, "hold_extra": 0.004})
+    ledger.add({**base, "request_type": "subagent"})  # another context: not part of the hold
+    ledger.add({**base, "held_for": "moderate", "recache_cost": 0.127, "hold_extra": 0.005})
+    assert (ledger.holds, ledger.requests) == (1, 2) and ledger.saved == pytest.approx(0.117)
+    ledger.add({**base, "tier": "light"})  # ended at a pause: no re-cache paid
+    ledger.add({**base, "held_for": "light", "recache_cost": 0.05, "hold_extra": 0.03, "session": "s2"})
+    ledger.add({**base, "held_for": "light", "recache_cost": 0.04, "hold_extra": 0.03, "session": "s2"})
+    ledger.add({**base, "session": "s2", "recache_cost": 0.045, "held_so_far": 0.06})  # moved at break-even
+    assert ledger.saved == pytest.approx(0.117 + (0.05 - 0.06 - 0.045))

@@ -22,6 +22,12 @@ The rules (see README.md, "How It Works"):
                             never above the highest tier the key can reach
                             (that ceiling if no tier runs it); effort as sent
 and the model that answered must be the one configured for the tier.
+
+Cache-aware holds: a request on the conversation's own cache may stay on a
+higher tier than the rules' -- "held for" the rules' tier -- only if that tier
+served the conversation's previous request, which started within the cache's
+lifetime, and the logged cost of moving still exceeded what holding had cost.
+A move down that was weighed must show moving was no dearer than holding.
 """
 import argparse
 import json
@@ -36,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from report import parse  # noqa: E402
-from events import REPO  # noqa: E402
+from events import REPO, on_conversation_cache  # noqa: E402
 
 from policy.decide import lowest, one_down  # noqa: E402
 from policy.models import model_key  # noqa: E402
@@ -50,6 +56,29 @@ def load_config() -> tuple[dict, dict[str, str]]:
 
 
 CATALOG_CHANGED = "skill no longer in the catalog"
+CACHE_TTL_SECONDS, CACHE_TTL_1H_SECONDS = 300, 3600  # as the gateway (policy/litellm_callback.py)
+HOLD_RULE = "held -> a higher tier the conversation is still cached on, while moving costs more"
+
+
+def hold_problems(event: dict, expected: str, order: list[str], previous: dict | None, one_hour: bool) -> list[str]:
+    """What is wrong with a request held above the rules' tier, if anything."""
+    tier, held_for = event.get("tier"), event.get("held_for")
+    problems = []
+    if held_for != expected:
+        problems.append(f"held for {held_for}, but the rules' tier is {expected}")
+    if tier not in order or held_for not in order or order.index(tier) <= order.index(held_for):
+        problems.append(f"held on {tier}, which is not above {held_for}")
+    if previous is None or previous.get("tier") != tier:
+        problems.append(f"held on {tier}, but the conversation's previous request wasn't served there")
+    else:
+        gap = (event.get("started_at") or 0) - (previous.get("started_at") or 0)
+        ttl = CACHE_TTL_1H_SECONDS if one_hour else CACHE_TTL_SECONDS
+        if event.get("started_at") and previous.get("started_at") and gap >= ttl:
+            problems.append(f"held on {tier}, but its cache had expired ({gap:.0f} s since the previous request)")
+    moving, held = event.get("recache_cost"), event.get("held_so_far") or 0
+    if not isinstance(moving, (int, float)) or moving <= held:
+        problems.append(f"held although moving (${moving}) cost no more than holding had (${held})")
+    return problems
 
 
 def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[str, str]) -> tuple[str | None, str]:
@@ -90,6 +119,10 @@ def expected_tier(event: dict, catalog: dict, agents: dict, tier_models: dict[st
 def check(events: list[tuple[datetime, str, dict]], catalog: dict, tier_models: dict[str, str]) -> dict:
     violations, checked, skipped, changed = [], 0, 0, 0
     agents: dict[tuple, str] = {}
+    # session -> its previous request on the conversation's own cache, and
+    # whether that conversation writes the 1-hour cache
+    previous: dict[str, dict] = {}
+    one_hour: set[str] = set()
     for when, kind, event in events:
         if kind != "spend":
             continue
@@ -103,8 +136,19 @@ def check(events: list[tuple[datetime, str, dict]], catalog: dict, tier_models: 
         checked += 1
         actual = event.get("tier")
         problems = []
-        if actual != expected:
+        session = event.get("session")
+        if event.get("held_for"):
+            rule = HOLD_RULE
+            problems += hold_problems(event, expected, catalog["order"], previous.get(session), session in one_hour)
+        elif actual != expected:
             problems.append(f"expected tier {expected}, got {actual}")
+        elif isinstance(event.get("recache_cost"), (int, float)) and event["recache_cost"] > (event.get("held_so_far") or 0):
+            problems.append(f"moved down although moving (${event['recache_cost']}) cost more than holding had "
+                            f"(${event.get('held_so_far') or 0})")
+        if on_conversation_cache(event):
+            previous[session] = event
+            if (event.get("cache_write_1h_tokens") or 0) > 0:
+                one_hour.add(session)
         served, configured = model_key(event.get("model")), model_key(tier_models.get(actual or ""))
         if served and configured and served != configured:
             problems.append(f"tier {actual} should run {configured}, but {served} answered")

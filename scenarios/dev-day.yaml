@@ -8,7 +8,9 @@
 #
 # `expect` is the check for that step's answer: text that must appear in it.
 # The demo skills start their answers with a fixed tag, which makes a simple,
-# objective pass/fail. `tier` is where the step's main request should go.
+# objective pass/fail. `tier` is where the rules send the step's main request;
+# a move down may run on the tier it came from for a while (⚓ held), which
+# still counts as that tier. `served`, when given, is where it must run.
 name: dev-day
 
 steps:

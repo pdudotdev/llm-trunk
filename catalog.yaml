@@ -4,6 +4,11 @@ version: 2
 # subagents run one step below their parent, never below the first.
 order: [light, moderate, complex]
 
+# Cache-aware switching: a move to a cheaper tier waits while the conversation
+# is still cached on its current tier and moving costs more than staying has
+# (see README, Concepts 101). false = always move at once.
+cache_aware: true
+
 # Each tier's model lives in litellm/config.yaml under the same name, so a
 # new model release is a one-line change there.
 tiers:

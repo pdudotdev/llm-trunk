@@ -19,8 +19,11 @@ EVENT_RE = re.compile(r"llm-trunk (?P<kind>spend|deny|expired|failed): (?P<json>
 ICONS = {
     "invoked": "🔖", "sticky": "📌", "untagged": "⚪",
     "unregistered": "🔹", "subagent": "🤖", "compaction": "🧹", "permission": "🔒", "title": "📛",
-    "denied": "⛔", "failed": "❌", "expired": "⏳",
+    "denied": "⛔", "failed": "❌", "expired": "⏳", "held": "⚓",
 }
+
+# Housekeeping calls that resend the conversation, so read and refresh its cache.
+CONTEXT_BACKGROUND = ("prompt_suggestion", "away_summary")
 
 
 def pretty_model(model_id: str) -> str:
@@ -51,6 +54,8 @@ def route_kind(event: dict) -> str:
         return "permission"
     if event.get("background") == "title":
         return "title"
+    if event.get("held_for"):
+        return "held"
     if request_type == "skill" and event.get("unregistered_skill"):
         return "unregistered"
     if event.get("skill_id") is None:
@@ -68,6 +73,47 @@ def request_type_of(event: dict) -> str:
     return "skill" if event.get("skill_hash") else "normal"
 
 
+def on_conversation_cache(event: dict) -> bool:
+    """Whether a request reads or writes the conversation's own cache: the
+    user's turns, compaction, suggestions and recaps -- not titles, permission
+    checks or subagents, which run on contexts of their own."""
+    kind = request_type_of(event)
+    if kind == "background":
+        return event.get("background") in CONTEXT_BACKGROUND
+    return kind in ("normal", "skill", "compaction")
+
+
+class HoldLedger:
+    """What cache-aware holds saved, from the log: per hold, the re-cache it
+    avoided (its cost when the hold began), minus what holding cost extra,
+    minus the re-cache still paid if it ended by moving at break-even. A hold
+    that ends at a pause or a move back up paid no re-cache at all."""
+
+    def __init__(self) -> None:
+        self.open: dict[str, list[float]] = {}  # session -> [avoided, extra so far]
+        self.closed = 0.0
+        self.holds = self.requests = 0
+
+    def add(self, event: dict) -> None:
+        if not on_conversation_cache(event):
+            return
+        session = event.get("session") or "?"
+        if event.get("held_for"):
+            self.requests += 1
+            if session not in self.open:
+                self.holds += 1
+                self.open[session] = [float(event.get("recache_cost") or 0), 0.0]
+            self.open[session][1] += float(event.get("hold_extra") or 0)
+        elif session in self.open:
+            avoided, extra = self.open.pop(session)
+            paid = event.get("recache_cost")
+            self.closed += avoided - extra - (max(float(paid), 0.0) if isinstance(paid, (int, float)) else 0.0)
+
+    @property
+    def saved(self) -> float:
+        return self.closed + sum(avoided - extra for avoided, extra in self.open.values())
+
+
 def tier_text(event: dict) -> str:
     """Where the request went: the tier, plus the skill that put it there."""
     tier = event.get("tier")
@@ -77,4 +123,6 @@ def tier_text(event: dict) -> str:
     if not tier:
         # Old events (per-skill lanes), or a passed-through request.
         return skill or "untagged"
+    if event.get("held_for"):
+        tier = f"{tier} (held for {event['held_for']})"
     return f"{tier} · {skill}" if skill else tier

@@ -27,6 +27,8 @@ services:
       - ./litellm/config.yaml:/app/config.yaml
       - ./policy:/app/policy
       - ./catalog.yaml:/app/catalog.yaml
+      # List prices, for cache-aware switching (weighing a move against a hold).
+      - ./pricing.yaml:/app/pricing.yaml
     ports:
       - "127.0.0.1:4000:4000"
     command: ["--config", "/app/config.yaml", "--port", "4000"]

@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from events import EVENT_RE, REPO, STAMP_RE, request_type_of  # noqa: E402
+from events import EVENT_RE, REPO, STAMP_RE, HoldLedger, request_type_of  # noqa: E402
 
 from policy.decide import REQUEST_TYPES  # noqa: E402  (events puts the repo on the path)
 
@@ -58,6 +58,7 @@ def summarize(events) -> dict:
     background = Counter()
     denies, failures = Counter(), Counter()
     estimate_errors = []
+    holds = HoldLedger()
     first = last = None
     for when, kind, event in events:
         first, last = first or when, when
@@ -67,6 +68,7 @@ def summarize(events) -> dict:
             failures[str(event.get("status") or "error")] += 1
         if kind != "spend":
             continue
+        holds.add(event)
         row = types[request_type_of(event)]
         cost = _number(event.get("cost"))
         # Events from before tiers carry their per-skill lane as the alias.
@@ -98,6 +100,7 @@ def summarize(events) -> dict:
         "denies": dict(denies),
         "failures": dict(failures),
         "estimate_errors": estimate_errors,
+        "holds": {"holds": holds.holds, "requests": holds.requests, "saved": holds.saved},
     }
 
 
@@ -152,6 +155,12 @@ def render(summary: dict) -> str:
         out.append(
             f"Input-size estimate vs billed: median {statistics.median(errors):+.0%}, "
             f"range {min(errors):+.0%} to {max(errors):+.0%} (n={len(errors)})"
+        )
+    holds = summary.get("holds") or {}
+    if holds.get("holds"):
+        out.append(
+            f"Cache-aware holds: {holds['holds']} ({holds['requests']} requests kept on a cached tier) · "
+            f"saved ≈ ${holds['saved']:.3f} (re-caches avoided, minus the extra paid while holding)"
         )
     top = sorted(summary["sessions"].items(), key=lambda item: -item[1])[:5]
     if top:

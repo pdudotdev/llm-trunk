@@ -1,0 +1,34 @@
+# Cache-aware switching, end to end: a move down that waits for the cache,
+# and the same move made for free once the cache has expired.
+#
+# Run with: python3 scenarios/run.py scenarios/cache-aware.yaml --cold-start
+# (--cold-start makes sure no tier has anything cached when it begins; about $0.60)
+#
+# `tier` is where the rules send the step; `served` is where it must really
+# run: above the rules' tier while held.
+name: cache-aware
+
+steps:
+  - name: design review
+    type: skill
+    tier: complex
+    served: complex
+    send: "/design-review Move session storage from sticky in-memory sessions to Redis, so any app server can serve any user."
+    expect: "[DEMO DESIGN REVIEW]"
+
+  - name: change review, held on the cached tier
+    type: skill
+    tier: moderate
+    served: complex
+    send: "/change-review A change that retries failed Redis writes up to 3 times with no backoff and swallows the final error."
+    expect: "[DEMO CHANGE REVIEW]"
+
+  - name: idle past the cache
+    type: idle
+    wait_seconds: 520  # past the ~3-minute recap, which reads the cache once more
+
+  - name: back after the break, moved down for free
+    type: normal
+    tier: light
+    served: light
+    send: "Which of those two reviews found the bigger risk? One sentence."

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import uuid
 from collections import OrderedDict
 from typing import Any
 
@@ -9,6 +10,7 @@ import yaml
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
+from policy.cache import hold_or_move, load_prices, prompt_cost, token_cost
 from policy.decide import BACKGROUND, COMPACTION, NORMAL, SKILL, SUBAGENT, decide, lowest
 from policy.hash import sha256_hex
 from policy.models import model_key
@@ -24,6 +26,7 @@ def _log(message: str) -> None:
 
 CATALOG_PATH = "/app/catalog.yaml"
 CONFIG_PATH = "/app/config.yaml"
+PRICING_PATH = "/app/pricing.yaml"
 MAX_STICKY_SESSIONS = 1024
 
 # Input-size estimate: a plain character count over everything the model is
@@ -45,10 +48,31 @@ MEDIA_BLOCK_TOKENS = 1600
 # independent limits, whichever elapses first evicts the entry back to "no
 # sticky route" (decide() then falls through to untagged, same as if the
 # skill had never been invoked).
-STICKY_IDLE_TIMEOUT_SECONDS = 600  # expires if unused this long
+STICKY_IDLE_TIMEOUT_SECONDS = 300  # expires if unused this long -- the
+# prompt cache's own lifetime: past it the conversation is no longer cached
+# anywhere, so moving down costs nothing extra.
 STICKY_MAX_AGE_SECONDS = 1800  # hard cap since the last real invocation --
 # not extended by continued sticky-only use, so periodically pinging the
 # conversation can't keep a route alive past this.
+
+# Cache-aware switching (see policy/cache.py). Claude Code on an API key writes
+# the main conversation with the 5-minute TTL (checked on the wire: a 343 s gap
+# was fully cold); a response that reports 1-hour writes switches that
+# conversation to the 1-hour TTL. The lifetime counts from each request's
+# start, and the margin covers the time between our hook and Anthropic.
+CACHE_TTL_SECONDS = 300
+CACHE_TTL_1H_SECONDS = 3600
+CACHE_MARGIN_SECONDS = 10
+# The largest minimum cacheable prompt among current models (Haiku 4.5): a
+# shorter prompt may not be cached at all, so there is nothing to hold for.
+MIN_CACHEABLE_TOKENS = 4096
+MAX_PREFIXES = 256
+# Requests whose reply still has to be accounted for, by opaque reference.
+MAX_PENDING = 1024
+# Where a request reads or writes the conversation's own cache: the user's
+# turns, compaction, and the housekeeping calls that resend the conversation.
+# Titles, permission checks and subagents run on contexts of their own.
+CONTEXT_BACKGROUND = ("prompt_suggestion", "away_summary")
 
 # Claude Code's actual wire format for a slash-invoked project skill: the
 # YAML frontmatter is stripped client-side and replaced with this tag plus a
@@ -93,6 +117,22 @@ def _tier_models() -> dict[str, str]:
         models = {entry["model_name"]: model_key(entry["litellm_params"]["model"]) for entry in config["model_list"]}
         _tier_models_cache = (mtime, models)
     return _tier_models_cache[1]
+
+
+_prices_cache: tuple[float, dict[str, dict]] | None = None
+
+
+def _tier_price(tier: str) -> dict | None:
+    """The list prices of the model a tier runs (pricing.yaml), or None when
+    that model has no price -- then there is nothing to weigh and no hold."""
+    global _prices_cache
+    try:
+        mtime = os.path.getmtime(PRICING_PATH)
+    except OSError:
+        return None
+    if _prices_cache is None or _prices_cache[0] != mtime:
+        _prices_cache = (mtime, load_prices(PRICING_PATH))
+    return _prices_cache[1].get(_tier_models().get(tier) or "")
 
 
 def passthrough_tier(catalog: dict, tier_models: dict[str, str], requested_model: str | None, ceiling: str) -> str:
@@ -223,6 +263,23 @@ def _usage_value(usage, *names):
     for name in names:
         value = getattr(usage, name, None)
         if value is not None:
+            return value
+    return None
+
+
+def _field(node, name: str):
+    return node.get(name) if isinstance(node, dict) else getattr(node, name, None)
+
+
+def _one_hour_writes(usage) -> int | None:
+    """Cache writes made with the 1-hour TTL: Anthropic's usage.cache_creation
+    split, which LiteLLM keeps under prompt_tokens_details."""
+    for split in (
+        _field(usage, "cache_creation"),
+        _field(_field(usage, "prompt_tokens_details"), "cache_creation_token_details"),
+    ):
+        value = _field(split, "ephemeral_1h_input_tokens")
+        if isinstance(value, int):
             return value
     return None
 
@@ -404,6 +461,18 @@ class SkillRoutingCallback(CustomLogger):
         self._sticky: OrderedDict[str, tuple[str, str, float, float]] = OrderedDict()
         # (session_key, agent id) -> tier: a subagent keeps its tier (and cache)
         self._agents: OrderedDict[tuple[str, str], str] = OrderedDict()
+        # session_key -> where the conversation's own cache lives: its tier,
+        # when a request last read or wrote it (monotonic), how big the last
+        # real turn was, which first message and tools+system it had, its TTL,
+        # and what the current hold has cost so far.
+        self._conversations: OrderedDict[str, dict] = OrderedDict()
+        # (tier, tools+system fingerprint) -> when a request last cached that
+        # prefix on the tier's model. Claude Code's tool list and system prompt
+        # are most of every request and are shared by sessions in the same
+        # directory, so a move down is often nearly free.
+        self._prefixes: OrderedDict[tuple[str, str], float] = OrderedDict()
+        # opaque reference -> session_key, until the request's reply is logged
+        self._pending: OrderedDict[str, str] = OrderedDict()
 
     def _session_key(self, user_api_key_dict, data: dict, headers: dict) -> str:
         key = (
@@ -485,6 +554,63 @@ class SkillRoutingCallback(CustomLogger):
         self._agents.move_to_end(agent_key)
         while len(self._agents) > MAX_AGENTS:
             self._agents.popitem(last=False)
+
+    @staticmethod
+    def _bounded_put(table: OrderedDict, key, value, limit: int) -> None:
+        table[key] = value
+        table.move_to_end(key)
+        while len(table) > limit:
+            table.popitem(last=False)
+
+    def _cache_aware(self, session_key: str, target: str, data: dict, catalog: dict, ceiling: str,
+                     estimated: int, real_turn: bool) -> tuple[str, dict]:
+        """The tier that serves a request on the conversation's own cache:
+        `target` (the rules' tier), or the higher tier the conversation is
+        still cached on while moving down costs more than holding has. Also
+        records where the conversation's cache now lives. Returns the tier
+        and the decision's facts for the log (empty when there was none)."""
+        now = time.monotonic()
+        order = catalog["order"]
+        prefix_tokens = _count_chars([data.get("system"), data.get("tools")]) // CHARS_PER_TOKEN
+        prefix = sha256_hex(json.dumps([data.get("system"), data.get("tools")], default=str).encode())
+        messages = data.get("messages") or []
+        first = sha256_hex(json.dumps(messages[:1], default=str).encode())
+        conversation = self._conversations.get(session_key)
+        ttl = conversation["ttl"] if conversation else CACHE_TTL_SECONDS
+
+        tier, facts = target, {}
+        warm = None
+        if conversation and now - conversation["started"] < ttl - CACHE_MARGIN_SECONDS:
+            warm = conversation["tier"]
+        if (
+            warm in catalog["tiers"] and catalog.get("cache_aware", True)
+            and order.index(target) < order.index(warm) <= order.index(ceiling)
+            and estimated >= MIN_CACHEABLE_TOKENS
+        ):
+            stay_price, move_price = _tier_price(warm), _tier_price(target)
+            if stay_price and move_price:
+                # Staying reads the conversation back up to its last real
+                # turn; after /compact or a rewind only tools+system remain.
+                extends = conversation["first"] == first and estimated >= conversation["tokens"]
+                cached_here = conversation["tokens"] if extends else (prefix_tokens if conversation["prefix"] == prefix else 0)
+                seen = self._prefixes.get((target, prefix))
+                cached_there = prefix_tokens if seen is not None and now - seen < ttl - CACHE_MARGIN_SECONDS else 0
+                penalty = prompt_cost(move_price, estimated, cached_there) - prompt_cost(stay_price, estimated, cached_here)
+                held = conversation["held"]
+                if hold_or_move(penalty, held):
+                    tier = warm
+                facts = {"warm_tier": warm, "held_for": target if tier == warm else None,
+                         "recache_cost": round(penalty, 5), "held_so_far": round(held, 5)}
+
+        state = conversation or {"tokens": 0, "first": first, "ttl": ttl}
+        state.update(tier=tier, started=now, prefix=prefix, held=state.get("held", 0.0) if tier != target else 0.0)
+        if real_turn:
+            # Housekeeping calls append their own instruction, which the next
+            # turn doesn't carry: only real turns set the cached size.
+            state.update(tokens=estimated, first=first)
+        self._bounded_put(self._conversations, session_key, state, MAX_STICKY_SESSIONS)
+        self._bounded_put(self._prefixes, (tier, prefix), now, MAX_PREFIXES)
+        return tier, facts
 
     def _headers_trusted(self, user_api_key_dict) -> bool:
         # x-skill-id/x-skill-hash are a self-asserted claim: the hash proves
@@ -611,6 +737,9 @@ class SkillRoutingCallback(CustomLogger):
             "requested_model": requested_model,
             "agent": (request.get("agent_id") or "")[:8] or None,
             "unregistered_skill": request.get("skill_name"),
+            # Wall clock at the request's start: the prompt cache's lifetime
+            # counts from here, not from when the reply was logged.
+            "started_at": round(time.time(), 3),
         }
 
         if background == "permission_check":
@@ -675,7 +804,23 @@ class SkillRoutingCallback(CustomLogger):
         elif request_type == SUBAGENT:
             self._remember_agent(agent_key, decision.tier)
 
-        data["model"] = decision.tier
+        # Where the request is served: the rules' tier, or -- for a request
+        # on the conversation's own cache -- the higher tier it is still
+        # cached on, while moving down would cost more than holding has.
+        # Holds never change whether a request is allowed: the input cap
+        # was already checked against the rules' tier, the lower one.
+        tier, cache_facts, ref = decision.tier, {}, None
+        if request_type in (NORMAL, SKILL, COMPACTION) or background in CONTEXT_BACKGROUND:
+            tier, cache_facts = self._cache_aware(
+                session_key, decision.tier, data, catalog, self._highest_tier(catalog, allowed),
+                routing["estimated_input_tokens"], real_turn=background is None,
+            )
+            ref = uuid.uuid4().hex
+            self._bounded_put(self._pending, ref, session_key, MAX_PENDING)
+        row = catalog["tiers"][tier]
+        effort, max_output = row["effort"], row["max_output"]
+
+        data["model"] = tier
         # Claude Code sends its own `thinking` + `output_config.effort` (the
         # user's /effort), and LiteLLM lets caller-supplied values win over
         # `reasoning_effort` -- left in place, the tier's effort is silently
@@ -693,21 +838,23 @@ class SkillRoutingCallback(CustomLogger):
             if not output_config:
                 del data["output_config"]
         if background != "title":
-            data["reasoning_effort"] = decision.effort
+            data["reasoning_effort"] = effort
         data["messages"] = _fold_system_messages(data.get("messages", []))
 
         requested_max = data.get("max_tokens")
         data["max_tokens"] = (
-            min(requested_max, decision.max_output) if requested_max else decision.max_output
+            min(requested_max, max_output) if requested_max else max_output
         )
 
         live = self._sticky.get(session_key)
         data.setdefault("litellm_metadata", {})["skill_routing"] = {
             **routing,
+            **cache_facts,
+            "cache_ref": ref,
             "skill_id": routing["skill_id"] if live or request_type == SKILL else None,
-            "alias": decision.tier,
-            "tier": decision.tier,
-            "effort": None if background == "title" else decision.effort,
+            "alias": tier,
+            "tier": tier,
+            "effort": None if background == "title" else effort,
             "sticky_expires_at": self._sticky_expires_at(session_key) if live and request_type != SUBAGENT else None,
         }
         return data
@@ -745,30 +892,68 @@ class SkillRoutingCallback(CustomLogger):
             "agent": routing.get("agent"),
             "unregistered_skill": routing.get("unregistered_skill"),
             "ceiling": routing.get("ceiling"),
+            "started_at": routing.get("started_at"),
+            # Set when a move down was weighed against the warm cache.
+            "warm_tier": routing.get("warm_tier"),
+            "held_for": routing.get("held_for"),
+            "recache_cost": routing.get("recache_cost"),
+            "held_so_far": routing.get("held_so_far"),
         }
+
+    def _settle(self, kwargs, fields: dict, usage, event: dict) -> float | None:
+        """After a reply on the conversation's own cache: learn the cache's
+        TTL, and add a held request's extra cost (vs the tier it was held for)
+        to its conversation's running total. Returns that extra cost."""
+        params = kwargs.get("litellm_params", {}) or {}
+        ref = next(
+            (source["skill_routing"].get("cache_ref") for source in
+             (params.get("metadata"), params.get("litellm_metadata"), kwargs.get("litellm_metadata"))
+             if isinstance(source, dict) and isinstance(source.get("skill_routing"), dict)),
+            None,
+        )
+        conversation = self._conversations.get(self._pending.pop(ref, None) or "")
+        if conversation is None:
+            return None
+        if (_one_hour_writes(usage) or 0) > 0:
+            conversation["ttl"] = CACHE_TTL_1H_SECONDS
+        held_for, tier = fields.get("held_for"), fields.get("tier")
+        if not held_for or not tier:
+            return None
+        here, there = _tier_price(tier), _tier_price(held_for)
+        actual = event.get("cost")
+        if not isinstance(actual, (int, float)):
+            actual = token_cost(event, here) if here else None
+        counterfactual = token_cost(event, there) if there else None
+        if actual is None or counterfactual is None:
+            return None
+        extra = actual - counterfactual
+        if conversation["tier"] == tier:
+            conversation["held"] += extra
+        return round(extra, 5)
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
         fields = self._routing_fields(kwargs)
         if fields is None:
             return
         usage = getattr(response_obj, "usage", None)
-        _log_event(
-            "spend",
-            {
-                **fields,
-                "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
-                "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
-                # Reads only: a cache *write* is billed at 1.25x, the opposite
-                # of what the dashboard's "(c)" tag claims.
-                "cache_read_tokens": _usage_value(usage, "cache_read_input_tokens"),
-                # Both are included in input_tokens (LiteLLM adds them in).
-                "cache_write_tokens": _usage_value(usage, "cache_creation_input_tokens"),
-                # The model that actually answered, as the API reports it: a
-                # tier's model can change later, the log line shouldn't.
-                "model": getattr(response_obj, "model", None),
-                "cost": kwargs.get("response_cost"),
-            },
-        )
+        event = {
+            **fields,
+            "input_tokens": _usage_value(usage, "prompt_tokens", "input_tokens"),
+            "output_tokens": _usage_value(usage, "completion_tokens", "output_tokens"),
+            # Reads only: a cache *write* is billed at 1.25x, the opposite
+            # of what the dashboard's "(c)" tag claims.
+            "cache_read_tokens": _usage_value(usage, "cache_read_input_tokens"),
+            # Both are included in input_tokens (LiteLLM adds them in).
+            "cache_write_tokens": _usage_value(usage, "cache_creation_input_tokens"),
+            # Of those writes, the ones made with the 1-hour TTL.
+            "cache_write_1h_tokens": _one_hour_writes(usage),
+            # The model that actually answered, as the API reports it: a
+            # tier's model can change later, the log line shouldn't.
+            "model": getattr(response_obj, "model", None),
+            "cost": kwargs.get("response_cost"),
+        }
+        event["hold_extra"] = self._settle(kwargs, fields, usage, event)
+        _log_event("spend", event)
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
         # A request that was routed but failed upstream (a 400, 429, 529...).

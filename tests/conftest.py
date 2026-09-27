@@ -88,6 +88,7 @@ def catalog(tmp_path, monkeypatch) -> dict:
     path.write_text(yaml.safe_dump(data))
     monkeypatch.setattr(cb, "CATALOG_PATH", str(path))
     monkeypatch.setattr(cb, "CONFIG_PATH", str(REPO / "litellm" / "config.yaml"))
+    monkeypatch.setattr(cb, "PRICING_PATH", str(REPO / "pricing.yaml"))
     return data
 
 

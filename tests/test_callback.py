@@ -116,23 +116,25 @@ def test_sticky_route_expires_after_idle_timeout(gateway, clock, capsys):
 
 def test_sticky_route_expires_at_max_age_even_while_used(gateway, clock, capsys):
     _invoke_plan(gateway)
-    for _ in range(3):  # a real turn every 500 s keeps the idle timer fresh...
-        clock.advance(500)
+    for _ in range(7):  # a real turn every 250 s keeps the idle timer fresh...
+        clock.advance(250)
         assert _follow_up(gateway)["model"] == "complex"
-    clock.advance(cb.STICKY_MAX_AGE_SECONDS - 1500 + 1)  # ...but not past max age
+    clock.advance(cb.STICKY_MAX_AGE_SECONDS - 1750 + 1)  # ...but not past max age
     assert _follow_up(gateway)["model"] == "light"
     assert '"why": "max-age"' in capsys.readouterr().out
 
 
 def test_reinvoking_while_live_resets_max_age(gateway, clock):
     # The route must still be live when the skill runs again (turns every
-    # 500 s keep it from idling out); otherwise re-invoking just starts fresh.
+    # 250 s keep it from idling out); otherwise re-invoking just starts fresh.
     _invoke_plan(gateway)
-    for _ in range(3):
-        clock.advance(500)
+    for _ in range(6):
+        clock.advance(250)
         _follow_up(gateway)
     _invoke_plan(gateway)  # at 1500 s, still live
-    clock.advance(400)  # 1900 s after the first invocation, 400 s after the second
+    clock.advance(250)
+    _follow_up(gateway)
+    clock.advance(250)  # 2000 s after the first invocation, 500 s after the second
     assert _follow_up(gateway)["model"] == "complex"
 
 
@@ -171,9 +173,9 @@ def test_skill_inside_a_subagent_does_not_lift_it(gateway):
 
 def test_subagent_does_not_touch_the_parent_route(gateway, clock):
     _invoke_plan(gateway)
-    clock.advance(500)
+    clock.advance(200)
     gateway.send(subagent_request())
-    clock.advance(200)  # 700 s since the parent's last real turn
+    clock.advance(150)  # 350 s since the parent's last real turn, 150 s since the subagent
     assert _follow_up(gateway)["model"] == "light"
 
 
@@ -196,9 +198,9 @@ def test_compaction_needs_the_claude_code_header(gateway):
 
 def test_compaction_does_not_refresh_the_route(gateway, clock):
     _invoke_plan(gateway)
-    clock.advance(500)
-    gateway.send(compaction_request(skill_turn("plan"), assistant(), user("go on")))
     clock.advance(200)
+    gateway.send(compaction_request(skill_turn("plan"), assistant(), user("go on")))
+    clock.advance(150)
     assert _follow_up(gateway)["model"] == "light"
 
 
@@ -228,18 +230,18 @@ def test_suggestion_stays_on_the_tier_with_its_effort(gateway):
 
 def test_recap_does_not_keep_a_route_alive(gateway, clock):
     _invoke_plan(gateway)
-    clock.advance(500)
+    clock.advance(200)
     recap = gateway.send(request(skill_turn("plan"), assistant(), user("The user stepped away and is coming back. Recap.")))
     assert routing(recap)["background"] == "away_summary" and recap["model"] == "complex"
-    clock.advance(200)
+    clock.advance(150)
     assert _follow_up(gateway)["model"] == "light"
 
 
 def test_background_detection_needs_the_claude_code_header(gateway, clock):
     _invoke_plan(gateway)
-    clock.advance(500)
+    clock.advance(200)
     gateway.send(request(skill_turn("plan"), assistant(), user("The user stepped away and is coming back."), claude_code=False))
-    clock.advance(200)  # the look-alike counted as a real turn, so the route is still fresh
+    clock.advance(150)  # the look-alike counted as a real turn, so the route is still fresh
     assert _follow_up(gateway)["model"] == "complex"
 
 
@@ -263,9 +265,9 @@ def test_permission_check_keeps_the_model_claude_code_chose(gateway, asked, tier
 
 def test_permission_check_does_not_touch_the_route(gateway, clock):
     _invoke_plan(gateway)
-    clock.advance(500)
-    gateway.send(permission_check_request())
     clock.advance(200)
+    gateway.send(permission_check_request())
+    clock.advance(150)
     assert _follow_up(gateway)["model"] == "light"
 
 
@@ -542,9 +544,11 @@ def test_log_hooks_ignore_requests_that_were_never_routed(gateway, capsys):
 
 
 def test_documented_limits():
-    # README: sticky for 10 minutes idle / 30 minutes since the last
-    # invocation; permission checks get at most 8,192 output tokens.
-    assert (cb.STICKY_IDLE_TIMEOUT_SECONDS, cb.STICKY_MAX_AGE_SECONDS) == (600, 1800)
+    # README: sticky for 5 minutes idle (the prompt cache's lifetime) / 30
+    # minutes since the last invocation; permission checks get at most 8,192
+    # output tokens.
+    assert (cb.STICKY_IDLE_TIMEOUT_SECONDS, cb.STICKY_MAX_AGE_SECONDS) == (300, 1800)
+    assert cb.STICKY_IDLE_TIMEOUT_SECONDS == cb.CACHE_TTL_SECONDS
     assert cb.PERMISSION_CHECK_MAX_OUTPUT == 8192
 
 

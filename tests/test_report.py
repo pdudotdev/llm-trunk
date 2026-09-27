@@ -99,3 +99,14 @@ def test_new_lines_group_by_request_type_and_tier():
 
 def test_token_amounts_are_readable():
     assert (report._tokens(1_500_000), report._tokens(40_000), report._tokens(900)) == ("1.5M", "40k", "0.9k")
+
+
+def test_report_shows_what_cache_aware_holds_saved():
+    lines = [
+        _line("2026-09-26T12:00:00", "spend", request_type="skill", tier="complex", held_for="moderate", recache_cost=0.126,
+              held_so_far=0.0, hold_extra=0.004, session="s1", cost=0.02, input_tokens=100, output_tokens=5),
+        _line("2026-09-26T12:10:00", "spend", request_type="normal", tier="light", session="s1", cost=0.05,
+              input_tokens=100, output_tokens=5),
+    ]
+    text = report.render(report.summarize(report.parse(lines)))
+    assert "Cache-aware holds: 1 (1 requests kept on a cached tier) · saved ≈ $0.122" in text

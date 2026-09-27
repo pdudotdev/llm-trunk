@@ -392,3 +392,87 @@ def test_sticky_timer_ends_with_the_route():
     dash.add(T0, "spend", _spend(request_type="skill", skill_id="plan", skill_hash="h", tier="complex", sticky_left_s=600))
     dash.add(T0, "spend", _spend(request_type="skill", unregistered_skill="notes", sticky_left_s=None))
     assert dash.sticky_left("s1") is None
+
+
+# --- Cache-aware switching: the warm baseline, holds --------------------------------
+
+
+def _turn(**fields):
+    base = {"request_type": "normal", "session": "s1", "requested_model": "claude-opus-5-5", "background": None,
+            "output_tokens": 300, "estimated_input_tokens": 40_000, "started_at": T0.timestamp()}
+    return _spend(**{**base, **fields})
+
+
+def test_baseline_counts_a_re_cache_the_gateway_caused_against_it():
+    # Plain chat on Haiku, then /design-review moves the conversation to Opus
+    # 20 s later: Opus has to write it all, where Claude Code on Opus all
+    # along would have read it back.
+    dash = _dashboard()
+    dash.add(T0, "spend", _turn(alias="light", cache_read_tokens=0, cache_write_tokens=40_000, cost=0.05))
+    upgrade = _turn(request_type="skill", skill_id="design-review", skill_hash="h", alias="complex", tier="complex",
+                    input_tokens=53_000, cache_read_tokens=0, cache_write_tokens=53_000, estimated_input_tokens=41_000,
+                    cost=0.278, started_at=T0.timestamp() + 20)
+    dash.add(T0, "spend", upgrade)
+    warm = token_cost_of(upgrade, read=round(53_000 * 40_000 / 41_000))
+    assert dash.type_compare["skill"][1] == pytest.approx(warm)
+    assert dash.type_saving("skill") < -5  # it cost several times more than staying would have
+    assert "⚠" in _screen(dash, width=200)
+
+
+def token_cost_of(event, *, read):
+    return dashboard.token_cost({**event, "cache_read_tokens": read, "cache_write_tokens": event["input_tokens"] - read},
+                                PRICES["claude-opus-5-5"])
+
+
+def test_baseline_after_a_pause_uses_the_requests_own_split():
+    dash = _dashboard()
+    dash.add(T0, "spend", _turn(alias="light", cache_read_tokens=0, cache_write_tokens=40_000, cost=0.05))
+    later = _turn(alias="complex", input_tokens=53_000, cache_read_tokens=0, cache_write_tokens=53_000,
+                  estimated_input_tokens=41_000, cost=0.278, started_at=T0.timestamp() + 301)
+    dash.add(T0, "spend", later)
+    assert dash.compared_without == pytest.approx(
+        dashboard.without_trunk(_turn(alias="light", cache_read_tokens=0, cache_write_tokens=40_000, cost=0.05),
+                                ROUTES["light"], PRICES) + 0.278)
+
+
+def test_baseline_starts_over_after_compaction():
+    dash = _dashboard()
+    dash.add(T0, "spend", _turn(alias="complex", cache_read_tokens=39_000, cache_write_tokens=1_000, cost=0.03))
+    dash.add(T0, "spend", _turn(request_type="compaction", alias="complex", cache_read_tokens=39_000,
+                                cache_write_tokens=1_000, estimated_input_tokens=41_000, cost=0.03))
+    after = _turn(alias="light", input_tokens=20_000, cache_read_tokens=15_000, cache_write_tokens=5_000,
+                  estimated_input_tokens=45_000, cost=0.01)  # bigger estimate: a new conversation, not an extension
+    assert dash.baseline.cost(T0, after, ROUTES["light"]) == pytest.approx(
+        dashboard.without_trunk(after, ROUTES["light"], PRICES))
+
+
+def test_suggestions_refresh_the_baseline_cache_without_becoming_its_prefix():
+    baseline = dashboard.Baseline(PRICES, 300)
+    baseline.cost(T0, _turn(estimated_input_tokens=40_000), ROUTES["complex"])
+    suggestion = _turn(request_type="background", background="prompt_suggestion", estimated_input_tokens=40_500,
+                       started_at=T0.timestamp() + 250)
+    baseline.cost(T0, suggestion, ROUTES["complex"])
+    assert baseline.sessions["s1"]["turn"]["estimated_input_tokens"] == 40_000
+    assert baseline.sessions["s1"]["touched"] == T0.timestamp() + 250
+
+
+def test_held_request_is_shown_with_its_reason():
+    clock = Clock()
+    dash = _dashboard(clock)
+    dash.add(T0, "spend", _turn(alias="complex", tier="complex", model="claude-opus-5-5", input_tokens=55_000))
+    held = _turn(request_type="skill", skill_id="change-review", skill_hash="h", alias="complex", tier="complex",
+                 model="claude-opus-5-5", input_tokens=56_000, held_for="moderate", warm_tier="complex",
+                 recache_cost=0.126, held_so_far=0.0, hold_extra=0.004)
+    dash.add(T0, "spend", held)
+    screen = _screen(dash, width=260)
+    assert "⚓ held" in screen and "held for moderate: moving now ≈$0.126 · held so far $0.000" in screen
+    assert "⚓ held for moderate" in screen and "moves after +$0.122 more or when cold" in screen
+    assert "cache holds" in screen and "saved $0.122" in screen
+
+
+def test_move_after_a_hold_is_explained():
+    note = dashboard.cache_note(_turn(tier="moderate", warm_tier="complex", recache_cost=0.05, held_so_far=0.06))
+    assert note.plain == "moved down from complex: holding cost $0.060 ≥ moving $0.050"
+    free = dashboard.cache_note(_turn(tier="light", warm_tier="complex", recache_cost=-0.003, held_so_far=0.0))
+    assert free.plain == "moved down from complex: moving was already cheaper"
+    assert dashboard.cache_note(_turn()) is None

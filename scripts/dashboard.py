@@ -14,8 +14,12 @@ with space/b, jump to the newest with g and the oldest with G; q quits.
 
 "Without llm-trunk" is an estimate: each request's own tokens priced at the
 model the client asked for (pricing.yaml), so a request routed to a cheaper
-tier shows what the tier saved. Requests logged before the gateway recorded
-the requested model can't be compared and are counted separately.
+tier shows what the tier saved. Claude Code talking to Anthropic directly
+never changes model, so while its cache is live the conversation would have
+been read back from it: a re-cache the gateway causes by moving the
+conversation to another model counts against the gateway, not as a saving.
+Requests logged before the gateway recorded the requested model can't be
+compared and are counted separately.
 """
 import argparse
 import itertools
@@ -44,9 +48,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from report import parse  # noqa: E402
 
-from events import ICONS, REPO, STAMP_RE, fmt_tokens, pretty_model, request_type_of, route_kind  # noqa: E402
+from events import (  # noqa: E402
+    ICONS, REPO, STAMP_RE, HoldLedger, fmt_tokens, on_conversation_cache, pretty_model, request_type_of, route_kind,
+)
 
-from policy.decide import REQUEST_TYPES  # noqa: E402  (events puts the repo on the path)
+from policy import cache  # noqa: E402  (events puts the repo on the path)
+from policy.cache import token_cost  # noqa: E402,F401  (shared with the gateway)
+from policy.decide import REQUEST_TYPES  # noqa: E402
 from policy.models import model_key  # noqa: E402
 
 MODEL_STYLES = {"Opus": "magenta", "Sonnet": "blue", "Haiku": "green", "Fable": "yellow"}
@@ -64,26 +72,13 @@ TYPES_WIDTH = 54  # the spend panel's widest line; the sessions panel gets the r
 
 
 def load_prices(path: Path = REPO / "pricing.yaml") -> dict[str, dict]:
-    return yaml.safe_load(path.read_text())["models"]
+    return cache.load_prices(path)
 
 
 def load_routes(path: Path = REPO / "litellm" / "config.yaml") -> dict[str, str]:
     """Tier -> the model it really calls."""
     config = yaml.safe_load(path.read_text())
     return {entry["model_name"]: entry["litellm_params"]["model"] for entry in config["model_list"]}
-
-
-def token_cost(event: dict, price: dict) -> float | None:
-    """A request's tokens priced at one model's list prices, in USD."""
-    total, output = event.get("input_tokens"), event.get("output_tokens")
-    if not isinstance(total, (int, float)) or not isinstance(output, (int, float)):
-        return None
-    read = event.get("cache_read_tokens") or 0
-    write = event.get("cache_write_tokens") or 0
-    fresh = max(0, total - read - write)  # LiteLLM's input count includes both
-    return (
-        fresh * price["input"] + read * price["cache_read"] + write * price["cache_write"] + output * price["output"]
-    ) / 1_000_000
 
 
 def without_trunk(event: dict, routed_model: str | None, prices: dict) -> float | None:
@@ -99,6 +94,51 @@ def without_trunk(event: dict, routed_model: str | None, prices: dict) -> float 
     # Scale LiteLLM's actual cost by the price ratio, so both sides agree
     # when the tier runs the model the client asked for.
     return actual * on_requested / on_routed if isinstance(actual, (int, float)) else on_requested
+
+
+class Baseline:
+    """"Without llm-trunk", request by request, for one stream of events.
+
+    Claude Code talking to Anthropic directly stays on the model it asked for,
+    so when the conversation's previous request started within the cache's
+    lifetime, its last real turn would have been read back from the cache --
+    whatever the gateway's own request had to re-write after moving it to
+    another tier. Otherwise (a first request, a pause, /compact, a /model
+    change) the request's own read/write split stands, as before."""
+
+    def __init__(self, prices: dict, ttl_seconds: int) -> None:
+        self.prices, self.ttl = prices, ttl_seconds
+        self.sessions: dict[str, dict] = {}
+
+    def cost(self, when: datetime, event: dict, routed_model: str | None) -> float | None:
+        baseline = without_trunk(event, routed_model, self.prices)
+        session = event.get("session")
+        if not session or not on_conversation_cache(event):
+            return baseline
+        started = event.get("started_at")
+        started = started if isinstance(started, (int, float)) else when.timestamp()
+        state = self.sessions.get(session)
+        turn = state["turn"] if state else None
+        estimate, total = event.get("estimated_input_tokens"), event.get("input_tokens")
+        requested = self.prices.get(model_key(event.get("requested_model")))
+        if (
+            baseline is not None and turn and requested and started - state["touched"] < self.ttl
+            and turn.get("request_type") != "compaction"
+            and turn.get("requested_model") == event.get("requested_model")
+            and isinstance(estimate, (int, float)) and isinstance(total, (int, float))
+            and isinstance(turn.get("estimated_input_tokens"), (int, float))
+            and 0 < turn["estimated_input_tokens"] <= estimate
+        ):
+            # Estimates are in characters, the same on every model; the share
+            # the last turn covers applies to this request's own token count.
+            read = max(round(total * turn["estimated_input_tokens"] / estimate), event.get("cache_read_tokens") or 0)
+            read = min(read, total)
+            warm = {**event, "cache_read_tokens": read, "cache_write_tokens": total - read}
+            baseline = token_cost(warm, requested)
+        # Suggestions and recaps refresh the cache but append their own
+        # instruction, which the next turn doesn't carry.
+        self.sessions[session] = {"touched": started, "turn": turn if event.get("background") else event}
+        return baseline
 
 
 def served_model(event: dict, routes: dict, prices: dict) -> str | None:
@@ -131,6 +171,8 @@ class Dashboard:
         self.sessions: dict[str, dict] = {}
         # session -> (skill, epoch when its sticky route expires if left idle)
         self.sticky: dict[str, tuple[str, float]] = {}
+        self.baseline = Baseline(prices, ttl_seconds)
+        self.holds = HoldLedger()
         self.feed: deque = deque(maxlen=FEED_HISTORY)
         # The feed lists newest first; scroll = how many newer rows are hidden
         # above the view. page = rows the view showed last time it was drawn.
@@ -199,17 +241,25 @@ class Dashboard:
         self.input_tokens += event.get("input_tokens") or 0
         self.cached_tokens += event.get("cache_read_tokens") or 0
         self._track_sticky(when, event)
-        # The cache clock and "next message" price follow the main conversation:
-        # subagents, titles and permission checks share the session but run
-        # another model on another context.
-        main_turn = kind in ("normal", "skill") and not event.get("background")
-        if main_turn and event.get("session") and isinstance(event.get("input_tokens"), (int, float)):
-            self.sessions[event["session"]] = {
-                "last": when.timestamp(),
-                "model": routed_model,
-                "context": event["input_tokens"],
-            }
-        baseline = without_trunk(event, routed_model, self.prices)
+        self.holds.add(event)
+        # The cache clock and "next message" price follow the conversation's
+        # own cache: subagents, titles and permission checks share the session
+        # but run on another context. The clock counts from the request's
+        # start; the context size comes from real turns only.
+        session = event.get("session")
+        if session and on_conversation_cache(event) and isinstance(event.get("input_tokens"), (int, float)):
+            started = event.get("started_at")
+            state = self.sessions.get(session)
+            real_turn = kind in ("normal", "skill") and not event.get("background")
+            if real_turn or state is None:
+                state = self.sessions[session] = {"context": event["input_tokens"]}
+            state["last"] = started if isinstance(started, (int, float)) else when.timestamp()
+            state["model"] = routed_model
+            state["hold"] = None
+            if event.get("held_for"):
+                left = (event.get("recache_cost") or 0) - (event.get("held_so_far") or 0) - (event.get("hold_extra") or 0)
+                state["hold"] = (event["held_for"], left)
+        baseline = self.baseline.cost(when, event, routed_model)
         if baseline is None:
             return None
         self.compared += 1
@@ -314,6 +364,10 @@ def types_panel(dash: Dashboard) -> Panel:
     table.add_row("", "", "", "", "")
     hit = dash.cached_tokens / dash.input_tokens if dash.input_tokens else 0
     table.add_row("input from cache", Text(("█" * round(hit * 8)).ljust(8), style="green"), f"{hit:.0%}", "", "")
+    holds = dash.holds
+    table.add_row(f"{ICONS['held']} cache holds", "", str(holds.holds), "",
+                  Text(f"saved {_money(holds.saved)}", style="green") if holds.saved > 0.0005
+                  else Text(f"{_money(holds.saved)}", style="dim") if holds.holds else Text(""))
     table.add_row("denied", "", str(dash.denies), "", "")
     return Panel(table, title="spend by request type · vs model asked for", title_align="left")
 
@@ -340,8 +394,14 @@ def sessions_panel(dash: Dashboard) -> Panel:
     for session, state in recent:
         warm, left, if_warm, if_cold = dash.cache_state(state)
         status = Text(f"● {_clock(left)}", style="green") if warm else Text("○ cold", style="bold red")
+        hold = state.get("hold") if warm else None
         if if_warm is None or if_cold is None:
             next_message = Text("", no_wrap=True, overflow="ellipsis")
+        elif hold:
+            # Held on a pricier tier: say where it will move, and when.
+            after = f"moves after +{_money(hold[1])} more" if hold[1] > 0 else "moves on the next message"
+            next_message = Text(f"{ICONS['held']} held for {hold[0]} · {_money(if_warm)} now · {after} or when cold",
+                                style="cyan", no_wrap=True, overflow="ellipsis")
         elif warm:
             next_message = Text(f"{_money(if_warm)} now · {_money(if_cold)} when cold", style="dim", no_wrap=True, overflow="ellipsis")
         else:
@@ -378,7 +438,7 @@ def feed_row(dash: Dashboard, when: datetime, kind: str, event: dict, saving: fl
             type_text(event), event.get("tier") or na,
             _model_text(served_model(event, dash.routes, dash.prices)), event.get("effort") or na,
             size, _money(cost) if isinstance(cost, (int, float)) else na, vs_asked(saving),
-        ], None
+        ], cache_note(event)
     if kind == "deny":
         # Refused before reaching Anthropic: no tier, model or cost.
         reason = str(event.get("reason", "")).removeprefix("llm-trunk: ")
@@ -398,6 +458,19 @@ def feed_row(dash: Dashboard, when: datetime, kind: str, event: dict, saving: fl
     note = f"{event.get('skill_id')} sticky route ended{ended} ({event.get('why')})"
     cells = [*lead, Text(f"{ICONS['expired']} expired", style="yellow"), na, event.get("tier") or na, *[na] * 5]
     return cells, Text(note, style="yellow")
+
+
+def cache_note(event: dict) -> Text | None:
+    """Why a request stayed on, or moved off, a tier its conversation was
+    still cached on. Nothing when no move down was weighed."""
+    moving, held = event.get("recache_cost"), event.get("held_so_far") or 0
+    if not isinstance(moving, (int, float)):
+        return None
+    if event.get("held_for"):
+        return Text(f"held for {event['held_for']}: moving now ≈{_money(max(moving, 0))} · held so far {_money(held)}",
+                    style="cyan")
+    why = "moving was already cheaper" if moving <= 0 else f"holding cost {_money(held)} ≥ moving {_money(moving)}"
+    return Text(f"moved down from {event.get('warm_tier')}: {why}", style="dim")
 
 
 def feed_lines(rows: list[tuple[list, Text | None]]) -> list[Text]:

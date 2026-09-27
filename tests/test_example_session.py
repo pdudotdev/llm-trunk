@@ -88,3 +88,12 @@ def test_row10_new_session_inherits_nothing(gateway):
     gateway.send(request(skill_turn("plan"), session="old-session"))
     data = gateway.send(request(user("Look at @src/app.py"), session="new-session"))
     assert data["model"] == "light"
+
+
+def test_row4_on_a_claude_code_sized_conversation_the_move_is_held(gateway):
+    # Claude Code's tools and system prompt alone are ~35k tokens: Opus still
+    # has it all cached, and re-caching it on Sonnet 5 would cost far more.
+    history = [user("context " * 7_500), assistant()]
+    gateway.send(request(*history, skill_turn("plan")))
+    data = gateway.send(request(*history, skill_turn("plan"), assistant(), skill_turn("review")))
+    assert data["model"] == "complex" and routing(data)["held_for"] == "moderate"
